@@ -1,0 +1,11 @@
+_build/
+*.cmi
+*.cmo
+*.cmx
+*.cmt
+*.cmti
+*.o
+*.a
+*.cmxa
+*.cmxs
+toyc

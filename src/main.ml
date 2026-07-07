@@ -3,7 +3,9 @@ let parse_channel ch filename =
   Lexing.set_filename lexbuf filename;
   try
     let ast = Parser.comp_unit Lexer.token lexbuf in
-    Print_ast.print_comp_unit ast;
+    let symtab = Semant.check_comp_unit ast in
+    let module_ir = Irgen.gen_module symtab ast in
+    Ir.print_module module_ir;
     0
   with
   | Lexer.LexError msg ->
