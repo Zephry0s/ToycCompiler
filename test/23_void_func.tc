@@ -1,0 +1,6 @@
+void nop() {
+}
+int main() {
+  nop();
+  return 99;
+}

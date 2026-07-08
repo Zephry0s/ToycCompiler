@@ -1,0 +1,6 @@
+int ga = 10;
+int gb = 20;
+int main() {
+  ga = gb;
+  return ga;
+}

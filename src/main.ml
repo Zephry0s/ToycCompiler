@@ -1,11 +1,11 @@
-let parse_channel ch filename =
+let parse_channel ch filename _opt =
   let lexbuf = Lexing.from_channel ch in
   Lexing.set_filename lexbuf filename;
   try
     let ast = Parser.comp_unit Lexer.token lexbuf in
     let symtab = Semant.check_comp_unit ast in
     let module_ir = Irgen.gen_module symtab ast in
-    Ir.print_module module_ir;
+    Codegen.gen module_ir;
     0
   with
   | Lexer.LexError msg ->
@@ -23,17 +23,22 @@ let parse_channel ch filename =
       1
 
 let () =
+  let opt_enabled = ref false in
+  let filename = ref None in
+  let rec parse_args = function
+    | [] -> ()
+    | "-opt" :: rest -> opt_enabled := true; parse_args rest
+    | f :: rest -> filename := Some f; parse_args rest
+  in
+  parse_args (List.tl (Array.to_list Sys.argv));
   let code =
-    match Sys.argv with
-    | [| _ |] ->
-        parse_channel stdin "<stdin>"
-    | [| _; filename |] ->
-        let ch = open_in filename in
-        let result = parse_channel ch filename in
+    match !filename with
+    | None ->
+        parse_channel stdin "<stdin>" !opt_enabled
+    | Some f ->
+        let ch = open_in f in
+        let result = parse_channel ch f !opt_enabled in
         close_in ch;
         result
-    | _ ->
-        Printf.eprintf "Usage: %s [file.tc]\n" Sys.argv.(0);
-        1
   in
   exit code

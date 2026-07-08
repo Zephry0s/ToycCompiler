@@ -41,6 +41,11 @@ make clean && make
 ```bash
 ./toyc < input.tc
 ```
+### 测试
+```bash
+/toyc < test/02_add.tc > result/output.s   
+```
+
 
 ## 已实现的语言特性
 

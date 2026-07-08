@@ -1,0 +1,9 @@
+int side_effect(int x) {
+  return x;
+}
+int main() {
+  int a = 0;
+  if (0 && side_effect(1)) a = 100;
+  if (1 || side_effect(2)) a = a + 1;
+  return a;
+}
