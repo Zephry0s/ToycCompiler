@@ -248,7 +248,7 @@ let gen_func (global_syms : symbol StringMap.t) (f : func_def) : func_ir =
          not (List.exists (fun (pn, _) -> pn = name) param_list))
     |> List.sort (fun (_, a) (_, b) -> compare a b)
   in
-  List.iteri (fun i p ->
+  List.iteri (fun i _ ->
     instrs := Sw (sp, 4 + 4 * i, VReg (1 + i)) :: !instrs
   ) f.params;
   let ctx = {
