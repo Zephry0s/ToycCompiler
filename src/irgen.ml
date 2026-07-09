@@ -4,7 +4,6 @@ open Semant
 
 type ctx = {
   mutable next_reg : int;
-  mutable next_lbl : int;
   mutable instrs  : instr list;
   symtab          : symbol StringMap.t;
   var_offs        : int StringMap.t;
@@ -19,9 +18,11 @@ let new_reg ctx =
   ctx.next_reg <- r + 1;
   r
 
-let new_label ctx prefix =
-  let n = ctx.next_lbl in
-  ctx.next_lbl <- n + 1;
+let global_lbl = ref 0
+
+let new_label prefix =
+  let n = !global_lbl in
+  global_lbl := n + 1;
   Printf.sprintf ".%s%d" prefix n
 
 let emit ctx i =
@@ -140,8 +141,8 @@ let rec gen_expr (ctx : ctx) (e : exp) : vreg =
 
 and gen_land ctx l r =
   let rd = new_reg ctx in
-  let false_l = new_label ctx "land_false" in
-  let end_l = new_label ctx "land_end" in
+  let false_l = new_label "land_false" in
+  let end_l = new_label "land_end" in
   let rl = gen_expr ctx l in
   emit ctx (Bz (VReg rl, false_l));
   let rr = gen_expr ctx r in
@@ -155,8 +156,8 @@ and gen_land ctx l r =
 
 and gen_lor ctx l r =
   let rd = new_reg ctx in
-  let true_l = new_label ctx "lor_true" in
-  let end_l = new_label ctx "lor_end" in
+  let true_l = new_label "lor_true" in
+  let end_l = new_label "lor_end" in
   let rl = gen_expr ctx l in
   emit ctx (Bnz (VReg rl, true_l));
   let rr = gen_expr ctx r in
@@ -190,8 +191,8 @@ let rec gen_stmt (ctx : ctx) (brk_lbl : string) (cnt_lbl : string)
         | _ -> failwith ("cannot assign to '" ^ name ^ "'")))
   | If (cond, th, el) ->
     let r = gen_expr ctx cond in
-    let else_l = new_label ctx "if_else" in
-    let end_l = new_label ctx "if_end" in
+    let else_l = new_label "if_else" in
+    let end_l = new_label "if_end" in
     emit ctx (Bz (VReg r, else_l));
     gen_stmt ctx brk_lbl cnt_lbl th;
     (match el with
@@ -203,8 +204,8 @@ let rec gen_stmt (ctx : ctx) (brk_lbl : string) (cnt_lbl : string)
        emit ctx (Label else_l));
     emit ctx (Label end_l)
   | While (cond, body) ->
-    let begin_l = new_label ctx "while" in
-    let end_l = new_label ctx "while_end" in
+    let begin_l = new_label "while" in
+    let end_l = new_label "while_end" in
     emit ctx (Label begin_l);
     let r = gen_expr ctx cond in
     emit ctx (Bz (VReg r, end_l));
@@ -237,7 +238,6 @@ let gen_func (global_syms : symbol StringMap.t) (f : func_def) : func_ir =
   let var_offs, const_vals, stack_sz =
     frame_info global_syms f.params f.body in
   let next_reg = ref (1 + List.length f.params) in
-  let next_lbl = ref 0 in
   let instrs = ref [] in
   let param_list = List.mapi (fun i p ->
     (p.p_name, 4 + 4 * i)) f.params
@@ -253,7 +253,6 @@ let gen_func (global_syms : symbol StringMap.t) (f : func_def) : func_ir =
   ) f.params;
   let ctx = {
     next_reg = !next_reg;
-    next_lbl = !next_lbl;
     instrs  = !instrs;
     symtab  = global_syms;
     var_offs;

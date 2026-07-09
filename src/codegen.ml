@@ -152,6 +152,22 @@ let emit_one buf spill_base reg_map = function
     Buffer.add_string buf (Printf.sprintf "  la %s, %s\n" dst name);
     Buffer.add_string buf st
   | Call (rd, fname, args) ->
+    let n_args = List.length args in
+    let excess = if n_args > 8 then n_args - 8 else 0 in
+    if excess > 0 then begin
+      Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" (-(excess * 4)));
+      let rec copy_excess i arg_list =
+        match arg_list with
+        | [] -> ()
+        | v :: rst when i >= 8 ->
+          let (rv, lv) = resolve_src reg_map spill_base spill_temp1 v in
+          Buffer.add_string buf lv;
+          Buffer.add_string buf (Printf.sprintf "  sw %s, %d(sp)\n" rv ((i - 8) * 4));
+          copy_excess (i + 1) rst
+        | _ :: rst -> copy_excess (i + 1) rst
+      in
+      copy_excess 0 args
+    end;
     List.iteri (fun i v ->
       if i < 8 then begin
         let areg = "a" ^ string_of_int i in
@@ -164,7 +180,9 @@ let emit_one buf spill_base reg_map = function
     Buffer.add_string buf (Printf.sprintf "  jal ra, %s\n" fname);
     let (dst, st) = resolve_dst reg_map spill_base spill_temp1 rd in
     Buffer.add_string buf (Printf.sprintf "  mv %s, a0\n" dst);
-    Buffer.add_string buf st
+    Buffer.add_string buf st;
+    if excess > 0 then
+      Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" (excess * 4))
   | Ret _ -> ()
   | Jmp label ->
     Buffer.add_string buf (Printf.sprintf "  j %s\n" label)
@@ -202,13 +220,24 @@ let emit_func buf f (fa : func_alloc) =
   let n_params = List.length f.fir_params in
   for i = 0 to n_params - 1 do
     let vreg = i + 1 in
-    let areg = "a" ^ string_of_int i in
-    match Hashtbl.find_opt fa.fa_reg_map vreg with
-    | Some (Reg r) ->
-      Buffer.add_string buf (Printf.sprintf "  mv %s, %s\n" r areg)
-    | Some (Spill off) ->
-      Buffer.add_string buf (Printf.sprintf "  sw %s, %d(sp)\n" areg (spill_base + off))
-    | None -> ()
+    if i < 8 then begin
+      let areg = "a" ^ string_of_int i in
+      match Hashtbl.find_opt fa.fa_reg_map vreg with
+      | Some (Reg r) ->
+        Buffer.add_string buf (Printf.sprintf "  mv %s, %s\n" r areg)
+      | Some (Spill off) ->
+        Buffer.add_string buf (Printf.sprintf "  sw %s, %d(sp)\n" areg (spill_base + off))
+      | None -> ()
+    end else begin
+      let caller_off = total_frame + (i - 8) * 4 in
+      match Hashtbl.find_opt fa.fa_reg_map vreg with
+      | Some (Reg r) ->
+        Buffer.add_string buf (Printf.sprintf "  lw %s, %d(sp)\n" r caller_off)
+      | Some (Spill off) ->
+        Buffer.add_string buf (Printf.sprintf "  lw %s, %d(sp)\n" spill_temp1 caller_off);
+        Buffer.add_string buf (Printf.sprintf "  sw %s, %d(sp)\n" spill_temp1 (spill_base + off))
+      | None -> ()
+    end
   done;
 
   List.iter (function
