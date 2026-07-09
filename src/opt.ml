@@ -253,7 +253,7 @@ let remove_dead_after_jmp (instrs : instr list) : instr list =
   done;
   List.rev !result
 
-(* --- Driver --- *)
+(* --- Driver for the local passes --- *)
 
 let optimize_func_body (body : instr list) : instr list =
   let rec loop iter body =
@@ -271,8 +271,79 @@ let optimize_func_body (body : instr list) : instr list =
   in
   loop 0 body
 
+(* --- CSE (basic-block-level) from incoming branch, adapted to use existing helpers --- *)
+
+type expr_key =
+  | KBinop of binop * value * value
+  | KUnop  of uop   * value
+  | KLi    of int
+  | KLa    of string
+  | KLw    of int             (* stack slot offset, Lw(0, off) only *)
+
+let cse_func (f : func_ir) : func_ir =
+  let tbl : (expr_key, vreg) Hashtbl.t = Hashtbl.create 64 in
+  let invalidate_lw off =
+    Hashtbl.filter_map_inplace
+      (fun k v -> match k with KLw o when o = off -> None | _ -> Some v)
+      tbl
+  in
+  let new_body =
+    List.map (fun instr ->
+      match instr with
+      | Binop (rd, op, v1, v2) ->
+        let key = KBinop (op, v1, v2) in
+        (match Hashtbl.find_opt tbl key with
+         | Some r -> Mov (rd, VReg r)
+         | None   -> Hashtbl.replace tbl key rd; instr)
+      | Unop (rd, op, v) ->
+        let key = KUnop (op, v) in
+        (match Hashtbl.find_opt tbl key with
+         | Some r -> Mov (rd, VReg r)
+         | None   -> Hashtbl.replace tbl key rd; instr)
+      | Li (rd, n) ->
+        let key = KLi n in
+        (match Hashtbl.find_opt tbl key with
+         | Some r -> Mov (rd, VReg r)
+         | None   -> Hashtbl.replace tbl key rd; instr)
+      | La (rd, name) ->
+        let key = KLa name in
+        (match Hashtbl.find_opt tbl key with
+         | Some r -> Mov (rd, VReg r)
+         | None   -> Hashtbl.replace tbl key rd; instr)
+      | Lw (rd, 0, off) ->
+        let key = KLw off in
+        (match Hashtbl.find_opt tbl key with
+         | Some r -> Mov (rd, VReg r)
+         | None   -> Hashtbl.replace tbl key rd; instr)
+      | Sw (0, off, _) ->
+        invalidate_lw off; instr
+      | Label _ ->
+        (* basic-block boundary: reset available expressions *)
+        Hashtbl.reset tbl; instr
+      | _ -> instr
+    ) f.fir_body
+  in
+  { f with fir_body = new_body }
+
+(* --- Iterative DCE wrapper using the local dead_code_elim pass --- *)
+
+let dce (f : func_ir) : func_ir =
+  let rec loop body =
+    let body' = dead_code_elim body in
+    if List.length body' = List.length body then body' else loop body'
+  in
+  { f with fir_body = loop f.fir_body }
+
+(* --- Combined optimize_func: run CSE -> local passes -> iterative DCE until convergence --- *)
+
 let optimize_func (f : func_ir) : func_ir =
-  { f with fir_body = optimize_func_body f.fir_body }
+  let rec loop f =
+    let f1 = cse_func f in
+    let f2 = { f1 with fir_body = optimize_func_body f1.fir_body } in
+    let f3 = dce f2 in
+    if List.length f3.fir_body = List.length f.fir_body then f3 else loop f3
+  in
+  loop f
 
 let optimize_module (m : module_ir) : module_ir =
   { m with mir_functions = List.map optimize_func m.mir_functions }

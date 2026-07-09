@@ -1,11 +1,11 @@
-let parse_channel ch filename _opt =
+let parse_channel ch filename opt =
   let lexbuf = Lexing.from_channel ch in
   Lexing.set_filename lexbuf filename;
   try
     let ast = Parser.comp_unit Lexer.token lexbuf in
     let symtab = Semant.check_comp_unit ast in
     let module_ir = Irgen.gen_module symtab ast in
-    let module_ir = if _opt then Opt.optimize_module module_ir else module_ir in
+let module_ir = if opt then Opt.optimize_module module_ir else module_ir in
     Codegen.gen module_ir;
     0
   with
