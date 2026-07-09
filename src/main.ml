@@ -23,7 +23,7 @@ let module_ir = if opt then Opt.optimize_module module_ir else module_ir in
         filename pos.pos_lnum (pos.pos_cnum - pos.pos_bol + 1) msg;
       1
 
-let () =
+let compile () =
   let opt_enabled = ref false in
   let filename = ref None in
   let rec parse_args = function

@@ -1,3 +1,4 @@
-(executable
- (name main)
+(library
+ (name toyc)
+ (modules :standard \ entry)
  (libraries))
