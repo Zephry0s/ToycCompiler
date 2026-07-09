@@ -1,180 +1,248 @@
 open Ir
 open Ast
+open Reg_alloc
 
 let align16 n = (n + 15) / 16 * 16
 
-let vreg_off stack_sz n = stack_sz + n * 4
+let spill_temp1 = "t5"
+let spill_temp2 = "t6"
 
-let load_val reg stack_sz = function
-  | VReg r -> Printf.sprintf "  lw %s, %d(sp)\n" reg (vreg_off stack_sz r)
-  | VImm n -> Printf.sprintf "  li %s, %d\n" reg n
+let resolve_src reg_map spill_base temp = function
+  | VImm n -> (temp, Printf.sprintf "  li %s, %d\n" temp n)
+  | VReg 0 -> ("sp", "")
+  | VReg r ->
+    match Hashtbl.find_opt reg_map r with
+    | Some (Reg reg) -> (reg, "")
+    | Some (Spill off) ->
+      (temp, Printf.sprintf "  lw %s, %d(sp)\n" temp (spill_base + off))
+    | None -> (temp, Printf.sprintf "  li %s, 0  # unalloc vreg %d\n" temp r)
 
-let rec max_vreg_instr m = function
-  | Binop (rd, _, v1, v2) ->
-    let m = max m rd in
-    let m = match v1 with VReg r -> max m r | _ -> m in
-    let m = match v2 with VReg r -> max m r | _ -> m in
-    m
-  | Unop (rd, _, v) ->
-    let m = max m rd in
-    (match v with VReg r -> max m r | _ -> m)
-  | Li (rd, _) | Mov (rd, _) | Lw (rd, _, _) | La (rd, _) ->
-    max m rd
-  | Sw (base, _, v) ->
-    let m = max m base in
-    (match v with VReg r -> max m r | _ -> m)
-  | Call (rd, _, args) ->
-    let m = max m rd in
-    List.fold_left (fun m v -> match v with VReg r -> max m r | _ -> m) m args
-  | Ret (Some v) ->
-    (match v with VReg r -> max m r | _ -> m)
-  | Ret None -> m
-  | Jmp _ | Label _ -> m
-  | Bz (v, _) -> (match v with VReg r -> max m r | _ -> m)
-  | Bnz (v, _) -> (match v with VReg r -> max m r | _ -> m)
+let resolve_dst reg_map spill_base temp rd =
+  match Hashtbl.find_opt reg_map rd with
+  | Some (Reg reg) -> (reg, "")
+  | Some (Spill off) ->
+    (temp, Printf.sprintf "  sw %s, %d(sp)\n" temp (spill_base + off))
+  | None -> failwith ("vreg " ^ string_of_int rd ^ " not allocated")
 
-let max_vreg instrs = List.fold_left max_vreg_instr 0 instrs
+let resolve_base reg_map spill_base base =
+  match Hashtbl.find_opt reg_map base with
+  | Some (Reg reg) -> (reg, "")
+  | Some (Spill off) ->
+    (spill_temp2, Printf.sprintf "  lw %s, %d(sp)\n" spill_temp2 (spill_base + off))
+  | None -> failwith ("vreg " ^ string_of_int base ^ " not allocated")
 
 let riscv_binop = function
   | Add -> "add" | Sub -> "sub" | Mul -> "mul" | Div -> "div" | Mod -> "rem"
   | _ -> "??"
 
-let emit_one buf stack_sz = function
+let emit_one buf spill_base reg_map = function
   | Binop (rd, Eq, v1, v2) ->
-    Buffer.add_string buf (load_val "t0" stack_sz v1);
-    Buffer.add_string buf (load_val "t1" stack_sz v2);
-    Buffer.add_string buf "  sub t0, t0, t1\n  seqz t0, t0\n";
-    Buffer.add_string buf (Printf.sprintf "  sw t0, %d(sp)\n" (vreg_off stack_sz rd))
+    let (r1, l1) = resolve_src reg_map spill_base spill_temp1 v1 in
+    let (r2, l2) = resolve_src reg_map spill_base spill_temp2 v2 in
+    let (dst, st) = resolve_dst reg_map spill_base spill_temp1 rd in
+    Buffer.add_string buf l1;
+    Buffer.add_string buf l2;
+    Buffer.add_string buf (Printf.sprintf "  sub %s, %s, %s\n  seqz %s, %s\n"
+                             dst r1 r2 dst dst);
+    Buffer.add_string buf st
   | Binop (rd, Neq, v1, v2) ->
-    Buffer.add_string buf (load_val "t0" stack_sz v1);
-    Buffer.add_string buf (load_val "t1" stack_sz v2);
-    Buffer.add_string buf "  sub t0, t0, t1\n  snez t0, t0\n";
-    Buffer.add_string buf (Printf.sprintf "  sw t0, %d(sp)\n" (vreg_off stack_sz rd))
+    let (r1, l1) = resolve_src reg_map spill_base spill_temp1 v1 in
+    let (r2, l2) = resolve_src reg_map spill_base spill_temp2 v2 in
+    let (dst, st) = resolve_dst reg_map spill_base spill_temp1 rd in
+    Buffer.add_string buf l1;
+    Buffer.add_string buf l2;
+    Buffer.add_string buf (Printf.sprintf "  sub %s, %s, %s\n  snez %s, %s\n"
+                             dst r1 r2 dst dst);
+    Buffer.add_string buf st
   | Binop (rd, Lt, v1, v2) ->
-    Buffer.add_string buf (load_val "t0" stack_sz v1);
-    Buffer.add_string buf (load_val "t1" stack_sz v2);
-    Buffer.add_string buf "  slt t0, t0, t1\n";
-    Buffer.add_string buf (Printf.sprintf "  sw t0, %d(sp)\n" (vreg_off stack_sz rd))
+    let (r1, l1) = resolve_src reg_map spill_base spill_temp1 v1 in
+    let (r2, l2) = resolve_src reg_map spill_base spill_temp2 v2 in
+    let (dst, st) = resolve_dst reg_map spill_base spill_temp1 rd in
+    Buffer.add_string buf l1;
+    Buffer.add_string buf l2;
+    Buffer.add_string buf (Printf.sprintf "  slt %s, %s, %s\n" dst r1 r2);
+    Buffer.add_string buf st
   | Binop (rd, Gt, v1, v2) ->
-    Buffer.add_string buf (load_val "t0" stack_sz v1);
-    Buffer.add_string buf (load_val "t1" stack_sz v2);
-    Buffer.add_string buf "  slt t0, t1, t0\n";
-    Buffer.add_string buf (Printf.sprintf "  sw t0, %d(sp)\n" (vreg_off stack_sz rd))
+    let (r1, l1) = resolve_src reg_map spill_base spill_temp1 v1 in
+    let (r2, l2) = resolve_src reg_map spill_base spill_temp2 v2 in
+    let (dst, st) = resolve_dst reg_map spill_base spill_temp1 rd in
+    Buffer.add_string buf l1;
+    Buffer.add_string buf l2;
+    Buffer.add_string buf (Printf.sprintf "  slt %s, %s, %s\n" dst r2 r1);
+    Buffer.add_string buf st
   | Binop (rd, Le, v1, v2) ->
-    Buffer.add_string buf (load_val "t0" stack_sz v1);
-    Buffer.add_string buf (load_val "t1" stack_sz v2);
-    Buffer.add_string buf "  slt t0, t1, t0\n  xori t0, t0, 1\n";
-    Buffer.add_string buf (Printf.sprintf "  sw t0, %d(sp)\n" (vreg_off stack_sz rd))
+    let (r1, l1) = resolve_src reg_map spill_base spill_temp1 v1 in
+    let (r2, l2) = resolve_src reg_map spill_base spill_temp2 v2 in
+    let (dst, st) = resolve_dst reg_map spill_base spill_temp1 rd in
+    Buffer.add_string buf l1;
+    Buffer.add_string buf l2;
+    Buffer.add_string buf (Printf.sprintf "  slt %s, %s, %s\n  xori %s, %s, 1\n"
+                             dst r2 r1 dst dst);
+    Buffer.add_string buf st
   | Binop (rd, Ge, v1, v2) ->
-    Buffer.add_string buf (load_val "t0" stack_sz v1);
-    Buffer.add_string buf (load_val "t1" stack_sz v2);
-    Buffer.add_string buf "  slt t0, t0, t1\n  xori t0, t0, 1\n";
-    Buffer.add_string buf (Printf.sprintf "  sw t0, %d(sp)\n" (vreg_off stack_sz rd))
+    let (r1, l1) = resolve_src reg_map spill_base spill_temp1 v1 in
+    let (r2, l2) = resolve_src reg_map spill_base spill_temp2 v2 in
+    let (dst, st) = resolve_dst reg_map spill_base spill_temp1 rd in
+    Buffer.add_string buf l1;
+    Buffer.add_string buf l2;
+    Buffer.add_string buf (Printf.sprintf "  slt %s, %s, %s\n  xori %s, %s, 1\n"
+                             dst r1 r2 dst dst);
+    Buffer.add_string buf st
   | Binop (rd, (Add | Sub | Mul | Div | Mod as op), v1, v2) ->
-    Buffer.add_string buf (load_val "t0" stack_sz v1);
-    Buffer.add_string buf (load_val "t1" stack_sz v2);
-    Buffer.add_string buf (Printf.sprintf "  %s t0, t0, t1\n" (riscv_binop op));
-    Buffer.add_string buf (Printf.sprintf "  sw t0, %d(sp)\n" (vreg_off stack_sz rd))
+    let (r1, l1) = resolve_src reg_map spill_base spill_temp1 v1 in
+    let (r2, l2) = resolve_src reg_map spill_base spill_temp2 v2 in
+    let (dst, st) = resolve_dst reg_map spill_base spill_temp1 rd in
+    Buffer.add_string buf l1;
+    Buffer.add_string buf l2;
+    Buffer.add_string buf (Printf.sprintf "  %s %s, %s, %s\n" (riscv_binop op) dst r1 r2);
+    Buffer.add_string buf st
   | Binop _ -> ()
   | Unop (rd, Neg, v) ->
-    Buffer.add_string buf (load_val "t0" stack_sz v);
-    Buffer.add_string buf "  neg t0, t0\n";
-    Buffer.add_string buf (Printf.sprintf "  sw t0, %d(sp)\n" (vreg_off stack_sz rd))
+    let (r1, l1) = resolve_src reg_map spill_base spill_temp1 v in
+    let (dst, st) = resolve_dst reg_map spill_base spill_temp1 rd in
+    Buffer.add_string buf l1;
+    Buffer.add_string buf (Printf.sprintf "  neg %s, %s\n" dst r1);
+    Buffer.add_string buf st
   | Unop (rd, Not, v) ->
-    Buffer.add_string buf (load_val "t0" stack_sz v);
-    Buffer.add_string buf "  seqz t0, t0\n";
-    Buffer.add_string buf (Printf.sprintf "  sw t0, %d(sp)\n" (vreg_off stack_sz rd))
+    let (r1, l1) = resolve_src reg_map spill_base spill_temp1 v in
+    let (dst, st) = resolve_dst reg_map spill_base spill_temp1 rd in
+    Buffer.add_string buf l1;
+    Buffer.add_string buf (Printf.sprintf "  seqz %s, %s\n" dst r1);
+    Buffer.add_string buf st
   | Unop (rd, Pos, v) ->
-    Buffer.add_string buf (load_val "t0" stack_sz v);
-    Buffer.add_string buf (Printf.sprintf "  sw t0, %d(sp)\n" (vreg_off stack_sz rd))
+    let (r1, l1) = resolve_src reg_map spill_base spill_temp1 v in
+    let (dst, st) = resolve_dst reg_map spill_base spill_temp1 rd in
+    Buffer.add_string buf l1;
+    if dst <> r1 then
+      Buffer.add_string buf (Printf.sprintf "  mv %s, %s\n" dst r1);
+    Buffer.add_string buf st
   | Li (rd, n) ->
-    Buffer.add_string buf (Printf.sprintf "  li t0, %d\n" n);
-    Buffer.add_string buf (Printf.sprintf "  sw t0, %d(sp)\n" (vreg_off stack_sz rd))
+    let (dst, st) = resolve_dst reg_map spill_base spill_temp1 rd in
+    Buffer.add_string buf (Printf.sprintf "  li %s, %d\n" dst n);
+    Buffer.add_string buf st
   | Mov (rd, v) ->
-    Buffer.add_string buf (load_val "t0" stack_sz v);
-    Buffer.add_string buf (Printf.sprintf "  sw t0, %d(sp)\n" (vreg_off stack_sz rd))
+    let (r1, l1) = resolve_src reg_map spill_base spill_temp1 v in
+    let (dst, st) = resolve_dst reg_map spill_base spill_temp1 rd in
+    Buffer.add_string buf l1;
+    if dst <> r1 then
+      Buffer.add_string buf (Printf.sprintf "  mv %s, %s\n" dst r1);
+    Buffer.add_string buf st
   | Lw (rd, 0, off) ->
-    Buffer.add_string buf (Printf.sprintf "  lw t0, %d(sp)\n" off);
-    Buffer.add_string buf (Printf.sprintf "  sw t0, %d(sp)\n" (vreg_off stack_sz rd))
+    let (dst, st) = resolve_dst reg_map spill_base spill_temp1 rd in
+    Buffer.add_string buf (Printf.sprintf "  lw %s, %d(sp)\n" dst off);
+    Buffer.add_string buf st
   | Lw (rd, base, off) ->
-    Buffer.add_string buf (Printf.sprintf "  lw t0, %d(sp)\n" (vreg_off stack_sz base));
-    Buffer.add_string buf (Printf.sprintf "  lw t0, %d(t0)\n" off);
-    Buffer.add_string buf (Printf.sprintf "  sw t0, %d(sp)\n" (vreg_off stack_sz rd))
+    let (rbase, lbase) = resolve_base reg_map spill_base base in
+    let (dst, st) = resolve_dst reg_map spill_base spill_temp1 rd in
+    Buffer.add_string buf lbase;
+    Buffer.add_string buf (Printf.sprintf "  lw %s, %d(%s)\n" dst off rbase);
+    Buffer.add_string buf st
   | Sw (0, off, v) ->
-    Buffer.add_string buf (load_val "t0" stack_sz v);
-    Buffer.add_string buf (Printf.sprintf "  sw t0, %d(sp)\n" off)
+    let (rv, lv) = resolve_src reg_map spill_base spill_temp1 v in
+    Buffer.add_string buf lv;
+    Buffer.add_string buf (Printf.sprintf "  sw %s, %d(sp)\n" rv off)
   | Sw (base, off, v) ->
-    Buffer.add_string buf (load_val "t0" stack_sz v);
-    Buffer.add_string buf (Printf.sprintf "  lw t1, %d(sp)\n" (vreg_off stack_sz base));
-    Buffer.add_string buf (Printf.sprintf "  sw t0, %d(t1)\n" off)
+    let (rbase, lbase) = resolve_base reg_map spill_base base in
+    let (rv, lv) = resolve_src reg_map spill_base spill_temp1 v in
+    Buffer.add_string buf lbase;
+    Buffer.add_string buf lv;
+    Buffer.add_string buf (Printf.sprintf "  sw %s, %d(%s)\n" rv off rbase)
   | La (rd, name) ->
-    Buffer.add_string buf (Printf.sprintf "  la t0, %s\n" name);
-    Buffer.add_string buf (Printf.sprintf "  sw t0, %d(sp)\n" (vreg_off stack_sz rd))
+    let (dst, st) = resolve_dst reg_map spill_base spill_temp1 rd in
+    Buffer.add_string buf (Printf.sprintf "  la %s, %s\n" dst name);
+    Buffer.add_string buf st
   | Call (rd, fname, args) ->
     List.iteri (fun i v ->
       if i < 8 then begin
-        let reg = "a" ^ string_of_int i in
-        Buffer.add_string buf (load_val reg stack_sz v)
+        let areg = "a" ^ string_of_int i in
+        let (rv, lv) = resolve_src reg_map spill_base areg v in
+        Buffer.add_string buf lv;
+        if rv <> areg then
+          Buffer.add_string buf (Printf.sprintf "  mv %s, %s\n" areg rv)
       end
     ) args;
     Buffer.add_string buf (Printf.sprintf "  jal ra, %s\n" fname);
-    Buffer.add_string buf (Printf.sprintf "  sw a0, %d(sp)\n" (vreg_off stack_sz rd))
+    let (dst, st) = resolve_dst reg_map spill_base spill_temp1 rd in
+    Buffer.add_string buf (Printf.sprintf "  mv %s, a0\n" dst);
+    Buffer.add_string buf st
   | Ret _ -> ()
   | Jmp label ->
     Buffer.add_string buf (Printf.sprintf "  j %s\n" label)
   | Bz (v, label) ->
-    Buffer.add_string buf (load_val "t0" stack_sz v);
-    Buffer.add_string buf (Printf.sprintf "  beqz t0, %s\n" label)
+    let (rv, lv) = resolve_src reg_map spill_base spill_temp1 v in
+    Buffer.add_string buf lv;
+    Buffer.add_string buf (Printf.sprintf "  beqz %s, %s\n" rv label)
   | Bnz (v, label) ->
-    Buffer.add_string buf (load_val "t0" stack_sz v);
-    Buffer.add_string buf (Printf.sprintf "  bnez t0, %s\n" label)
+    let (rv, lv) = resolve_src reg_map spill_base spill_temp1 v in
+    Buffer.add_string buf lv;
+    Buffer.add_string buf (Printf.sprintf "  bnez %s, %s\n" rv label)
   | Label name ->
     Buffer.add_string buf (Printf.sprintf "%s:\n" name)
 
-let emit_epilogue buf ra_off total_frame =
-  Buffer.add_string buf (Printf.sprintf "  lw ra, %d(sp)\n" ra_off);
-  Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" total_frame);
-  Buffer.add_string buf "  ret\n"
-
-let emit_func buf f =
+let emit_func buf f (fa : func_alloc) =
   let stack_sz = f.fir_stack_sz in
-  let mv = max_vreg f.fir_body in
-  let n_params = List.length f.fir_params in
-  let max_v = max mv n_params in
-  let unaligned = stack_sz + (max_v + 1) * 4 + 4 in
-  let total = align16 unaligned in
-  let ra_off = total - 4 in
+  let spill_sz = fa.fa_spill_sz in
+  let callee_count = List.length fa.fa_callee_used in
+  let total_frame = align16 (stack_sz + spill_sz + callee_count * 4 + 4) in
+  let ra_off = total_frame - 4 in
+  let spill_base = stack_sz in
 
   let ret_label = "." ^ f.fir_name ^ "_ret" in
 
   Buffer.add_string buf (Printf.sprintf "\n  .globl %s\n" f.fir_name);
   Buffer.add_string buf (Printf.sprintf "%s:\n" f.fir_name);
-  Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" (-total));
+  Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" (-total_frame));
   Buffer.add_string buf (Printf.sprintf "  sw ra, %d(sp)\n" ra_off);
 
+  List.iteri (fun i reg ->
+    let off = stack_sz + spill_sz + i * 4 in
+    Buffer.add_string buf (Printf.sprintf "  sw %s, %d(sp)\n" reg off)
+  ) fa.fa_callee_used;
+
+  let n_params = List.length f.fir_params in
   for i = 0 to n_params - 1 do
-    Buffer.add_string buf
-      (Printf.sprintf "  sw a%d, %d(sp)\n" i (vreg_off stack_sz (i+1)))
+    let vreg = i + 1 in
+    let areg = "a" ^ string_of_int i in
+    match Hashtbl.find_opt fa.fa_reg_map vreg with
+    | Some (Reg r) ->
+      Buffer.add_string buf (Printf.sprintf "  mv %s, %s\n" r areg)
+    | Some (Spill off) ->
+      Buffer.add_string buf (Printf.sprintf "  sw %s, %d(sp)\n" areg (spill_base + off))
+    | None -> ()
   done;
 
   List.iter (function
     | Ret (Some v) ->
-      Buffer.add_string buf (load_val "a0" stack_sz v);
+      let (rv, lv) = resolve_src fa.fa_reg_map spill_base "a0" v in
+      Buffer.add_string buf lv;
+      if rv <> "a0" then
+        Buffer.add_string buf (Printf.sprintf "  mv a0, %s\n" rv);
       Buffer.add_string buf (Printf.sprintf "  j %s\n" ret_label)
     | Ret None ->
       Buffer.add_string buf (Printf.sprintf "  j %s\n" ret_label)
     | instr ->
-      emit_one buf stack_sz instr
+      emit_one buf spill_base fa.fa_reg_map instr
   ) f.fir_body;
 
   Buffer.add_string buf (Printf.sprintf "%s:\n" ret_label);
   if f.fir_name = "main" then begin
+    List.iteri (fun i reg ->
+      let off = stack_sz + spill_sz + i * 4 in
+      Buffer.add_string buf (Printf.sprintf "  lw %s, %d(sp)\n" reg off)
+    ) fa.fa_callee_used;
     Buffer.add_string buf (Printf.sprintf "  lw ra, %d(sp)\n" ra_off);
-    Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" total);
+    Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" total_frame);
     Buffer.add_string buf "  li a7, 10\n";
     Buffer.add_string buf "  ecall\n"
-  end else
-    emit_epilogue buf ra_off total
+  end else begin
+    List.iteri (fun i reg ->
+      let off = stack_sz + spill_sz + i * 4 in
+      Buffer.add_string buf (Printf.sprintf "  lw %s, %d(sp)\n" reg off)
+    ) fa.fa_callee_used;
+    Buffer.add_string buf (Printf.sprintf "  lw ra, %d(sp)\n" ra_off);
+    Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" total_frame);
+    Buffer.add_string buf "  ret\n"
+  end
 
 let emit_globals buf globals =
   if globals <> [] then begin
@@ -190,5 +258,8 @@ let gen (m : module_ir) =
   let buf = Buffer.create 65536 in
   emit_globals buf m.mir_globals;
   Buffer.add_string buf ".text\n";
-  List.iter (emit_func buf) m.mir_functions;
+  List.iter (fun f ->
+    let fa = Reg_alloc.alloc_func f in
+    emit_func buf f fa
+  ) m.mir_functions;
   print_string (Buffer.contents buf)
