@@ -11,10 +11,11 @@ toyc: src/lexer.ml
 	cd src && ocamlc -c semant.ml
 	cd src && ocamlc -c ir.ml
 	cd src && ocamlc -c irgen.ml
+	cd src && ocamlc -c opt.ml
 	cd src && ocamlc -c reg_alloc.ml
 	cd src && ocamlc -c codegen.ml
 	cd src && ocamlc -c main.ml
-	cd src && ocamlc -o ../toyc token.cmo ast.cmo print_ast.cmo lexer.cmo parser.cmo semant.cmo ir.cmo irgen.cmo reg_alloc.cmo codegen.cmo main.cmo
+	cd src && ocamlc -o ../toyc token.cmo ast.cmo print_ast.cmo lexer.cmo parser.cmo semant.cmo ir.cmo irgen.cmo opt.cmo reg_alloc.cmo codegen.cmo main.cmo
 
 src/lexer.ml: src/lexer.mll src/token.ml
 	cd src && ocamlc -c token.ml && ocamllex lexer.mll

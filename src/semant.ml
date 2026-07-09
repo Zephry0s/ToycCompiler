@@ -212,7 +212,7 @@ let check_comp_unit (cu : comp_unit) : symbol StringMap.t =
         failwith ("duplicate function '" ^ f.name ^ "'");
       let fi = { f_ret = f.ret_type; f_params = f.params } in
       globals := StringMap.add f.name (SymFunc fi) !globals
-    | TopDecl d -> ()
+    | TopDecl _ -> ()
   ) cu;
   (match StringMap.find_opt "main" !globals with
    | Some (SymFunc fi) ->

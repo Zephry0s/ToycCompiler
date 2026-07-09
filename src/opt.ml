@@ -1,0 +1,278 @@
+open Ast
+open Ir
+
+let max_iterations = 5
+
+(* --- Utility --- *)
+
+let eval_binop op a b = match op with
+  | Add -> a + b | Sub -> a - b | Mul -> a * b
+  | Div -> a / b | Mod -> a mod b
+  | And -> if a <> 0 && b <> 0 then 1 else 0
+  | Or  -> if a <> 0 || b <> 0 then 1 else 0
+  | Eq  -> if a = b  then 1 else 0
+  | Neq -> if a <> b then 1 else 0
+  | Lt  -> if a < b  then 1 else 0
+  | Gt  -> if a > b  then 1 else 0
+  | Le  -> if a <= b then 1 else 0
+  | Ge  -> if a >= b then 1 else 0
+
+let eval_uop op n = match op with
+  | Neg -> -n | Pos -> n | Not -> if n = 0 then 1 else 0
+
+let has_side_effect = function
+  | Sw _ | Call _ | Ret _ | Jmp _ | Bz _ | Bnz _ | Label _ -> true
+  | _ -> false
+
+let def_vreg = function
+  | Binop (rd, _, _, _) | Unop (rd, _, _) | Li (rd, _) | Mov (rd, _)
+  | Lw (rd, _, _) | La (rd, _) | Call (rd, _, _) -> Some rd
+  | _ -> None
+
+let vreg_of_val = function VReg r -> [r] | VImm _ -> []
+
+let src_vregs = function
+  | Binop (_, _, v1, v2) -> vreg_of_val v1 @ vreg_of_val v2
+  | Unop (_, _, v) | Mov (_, v) -> vreg_of_val v
+  | Lw (_, base, _) -> [base]
+  | Sw (base, _, v) -> base :: vreg_of_val v
+  | Call (_, _, args) ->
+    List.fold_left (fun acc v -> acc @ vreg_of_val v) [] args
+  | Ret (Some v) -> vreg_of_val v
+  | Ret None -> []
+  | Bz (v, _) | Bnz (v, _) -> vreg_of_val v
+  | Li _ | La _ | Jmp _ | Label _ -> []
+
+(* --- Basic block partitioning for copy propagation --- *)
+
+let split_blocks (instrs : instr list) : instr list list =
+  let arr = Array.of_list instrs in
+  let n = Array.length arr in
+  if n = 0 then [] else begin
+    let starts = Array.make n false in
+    starts.(0) <- true;
+    for i = 0 to n - 1 do
+      match arr.(i) with
+      | Label _ -> starts.(i) <- true
+      | Jmp _ | Bz _ | Bnz _ | Ret _ ->
+        if i + 1 < n then starts.(i + 1) <- true
+      | _ -> ()
+    done;
+    let blocks = ref [] in
+    let i = ref 0 in
+    while !i < n do
+      if starts.(!i) then begin
+        let start = !i in
+        let j = ref (start + 1) in
+        while !j < n && not starts.(!j) do incr j done;
+        let blk = Array.to_list (Array.sub arr start (!j - start)) in
+        blocks := blk :: !blocks;
+        i := !j
+      end else
+        incr i
+    done;
+    List.rev !blocks
+  end
+
+(* --- Value substitution for copy propagation --- *)
+
+let rec subst_val (subst : (vreg, value) Hashtbl.t) (v : value) : value =
+  match v with
+  | VImm _ -> v
+  | VReg r when r = 0 -> v
+  | VReg r ->
+    match Hashtbl.find_opt subst r with
+    | Some v' -> subst_val subst v'
+    | None -> v
+
+let subst_base (subst : (vreg, value) Hashtbl.t) (base : vreg) : vreg =
+  match Hashtbl.find_opt subst base with
+  | Some (VReg r) -> r
+  | _ -> base
+
+let subst_instr (subst : (vreg, value) Hashtbl.t) (i : instr) : instr =
+  let sv = subst_val subst in
+  let sb = subst_base subst in
+  match i with
+  | Binop (rd, op, v1, v2) -> Binop (rd, op, sv v1, sv v2)
+  | Unop (rd, op, v) -> Unop (rd, op, sv v)
+  | Mov (rd, v) -> Mov (rd, sv v)
+  | Lw (rd, base, off) -> Lw (rd, sb base, off)
+  | Sw (base, off, v) -> Sw (sb base, off, sv v)
+  | Call (rd, name, args) -> Call (rd, name, List.map sv args)
+  | Ret (Some v) -> Ret (Some (sv v))
+  | Ret None -> Ret None
+  | Bz (v, lbl) -> Bz (sv v, lbl)
+  | Bnz (v, lbl) -> Bnz (sv v, lbl)
+  | Li _ | La _ | Jmp _ | Label _ -> i
+
+(* --- Pass 1: Constant Folding --- *)
+
+let const_fold (instrs : instr list) : instr list =
+  List.map (fun i -> match i with
+    | Binop (rd, op, VImm a, VImm b) ->
+      (match op with
+       | Div | Mod when b = 0 -> i
+       | _ -> Li (rd, eval_binop op a b))
+    | Unop (rd, op, VImm n) ->
+      Li (rd, eval_uop op n)
+    | Mov (rd, VImm n) ->
+      Li (rd, n)
+    | _ -> i
+  ) instrs
+
+(* --- Pass 2: Algebraic Simplification --- *)
+
+let alg_simplify (instrs : instr list) : instr list =
+  List.map (fun i -> match i with
+    | Binop (rd, Add, v, VImm 0) | Binop (rd, Add, VImm 0, v) -> Mov (rd, v)
+    | Binop (rd, Sub, v, VImm 0) -> Mov (rd, v)
+    | Binop (rd, Mul, v, VImm 1) | Binop (rd, Mul, VImm 1, v) -> Mov (rd, v)
+    | Binop (rd, Mul, _, VImm 0) | Binop (rd, Mul, VImm 0, _) -> Li (rd, 0)
+    | Binop (rd, Div, v, VImm 1) -> Mov (rd, v)
+    | Binop (rd, Div, VImm 0, VImm n) when n <> 0 -> Li (rd, 0)
+    | Binop (rd, Mod, _, VImm 1) -> Li (rd, 0)
+    | Binop (rd, Mod, VImm 0, VImm n) when n <> 0 -> Li (rd, 0)
+    | Binop (rd, Sub, VReg r1, VReg r2) when r1 = r2 -> Li (rd, 0)
+    | Binop (rd, Eq, VReg r1, VReg r2) when r1 = r2 -> Li (rd, 1)
+    | Binop (rd, Neq, VReg r1, VReg r2) when r1 = r2 -> Li (rd, 0)
+    | _ -> i
+  ) instrs
+
+(* --- Pass 3: Copy Propagation --- *)
+
+let copy_prop_block (instrs : instr list) : instr list =
+  let subst = Hashtbl.create 16 in
+  let changed = ref false in
+  let result = List.map (fun i ->
+    let i' = subst_instr subst i in
+    if i' <> i then changed := true;
+    (match i' with
+     | Mov (rd, v) -> Hashtbl.replace subst rd v
+     | Li (rd, n) -> Hashtbl.replace subst rd (VImm n)
+     | _ -> ());
+    i'
+  ) instrs in
+  if !changed then result else instrs
+
+let copy_prop (instrs : instr list) : instr list =
+  let blocks = split_blocks instrs in
+  let blocks' = List.map copy_prop_block blocks in
+  List.fold_left (@) [] blocks'
+
+(* --- Pass 4: Dead Code Elimination --- *)
+
+let dead_code_elim (instrs : instr list) : instr list =
+  let instr_arr = Array.of_list instrs in
+  let n = Array.length instr_arr in
+  let def_map = Hashtbl.create 64 in
+  let side_effect_idxs = ref [] in
+  for idx = 0 to n - 1 do
+    (match def_vreg instr_arr.(idx) with
+     | Some rd ->
+       let existing = match Hashtbl.find_opt def_map rd with
+         | Some idxs -> idxs | None -> []
+       in
+       Hashtbl.replace def_map rd (idx :: existing)
+     | None -> ());
+    if has_side_effect instr_arr.(idx) then
+      side_effect_idxs := idx :: !side_effect_idxs
+  done;
+  let live = Array.make n false in
+  let worklist = Queue.create () in
+  let enqueue r = if r <> 0 then Queue.add r worklist in
+  List.iter (fun idx ->
+    live.(idx) <- true;
+    List.iter enqueue (src_vregs instr_arr.(idx))
+  ) !side_effect_idxs;
+  while not (Queue.is_empty worklist) do
+    let r = Queue.take worklist in
+    if r <> 0 then
+      match Hashtbl.find_opt def_map r with
+      | Some idxs ->
+        List.iter (fun idx ->
+          if not live.(idx) then begin
+            live.(idx) <- true;
+            List.iter enqueue (src_vregs instr_arr.(idx))
+          end
+        ) idxs
+      | None -> ()
+  done;
+  let result = ref [] in
+  for idx = 0 to n - 1 do
+    if live.(idx) then result := instr_arr.(idx) :: !result
+  done;
+  List.rev !result
+
+(* --- Pass 5: Peephole --- *)
+
+let rec peephole_scan (acc : instr list) (instrs : instr list) : instr list =
+  match instrs with
+  | [] -> List.rev acc
+  | (Li _ as li) :: (Bz (VReg r, lbl)) :: rest ->
+    (match li with
+     | Li (rd, 0) when rd = r -> peephole_scan (li :: acc) (Jmp lbl :: rest)
+     | Li (rd, n) when rd = r && n <> 0 -> peephole_scan (li :: acc) rest
+     | _ -> peephole_scan (Bz (VReg r, lbl) :: li :: acc) rest)
+  | (Li _ as li) :: (Bnz (VReg r, lbl)) :: rest ->
+    (match li with
+     | Li (rd, 1) when rd = r -> peephole_scan (li :: acc) (Jmp lbl :: rest)
+     | Li (rd, 0) when rd = r -> peephole_scan (li :: acc) rest
+     | _ -> peephole_scan (Bnz (VReg r, lbl) :: li :: acc) rest)
+  | Bz (VImm 0, lbl) :: rest -> peephole_scan acc (Jmp lbl :: rest)
+  | Bz (VImm _, _) :: rest -> peephole_scan acc rest
+  | Bnz (VImm 0, _) :: rest -> peephole_scan acc rest
+  | Bnz (VImm n, lbl) :: rest when n <> 0 -> peephole_scan acc (Jmp lbl :: rest)
+  | (Jmp lbl1) :: (Label lbl2) :: rest when lbl1 = lbl2 ->
+    peephole_scan (Label lbl2 :: acc) rest
+  | i :: rest -> peephole_scan (i :: acc) rest
+
+let peephole (instrs : instr list) : instr list =
+  peephole_scan [] instrs
+
+(* --- Pass 6: Dead code after unconditional jumps --- *)
+
+let remove_dead_after_jmp (instrs : instr list) : instr list =
+  let arr = Array.of_list instrs in
+  let n = Array.length arr in
+  let keep = Array.make n true in
+  for i = 0 to n - 1 do
+    match arr.(i) with
+    | Jmp _ | Ret _ ->
+      let j = ref (i + 1) in
+      while !j < n do
+        match arr.(!j) with
+        | Label _ -> j := n
+        | _ -> keep.(!j) <- false; incr j
+      done
+    | _ -> ()
+  done;
+  let result = ref [] in
+  for i = 0 to n - 1 do
+    if keep.(i) then result := arr.(i) :: !result
+  done;
+  List.rev !result
+
+(* --- Driver --- *)
+
+let optimize_func_body (body : instr list) : instr list =
+  let rec loop iter body =
+    if iter >= max_iterations then body
+    else
+      let body' = body
+        |> const_fold
+        |> alg_simplify
+        |> copy_prop
+        |> dead_code_elim
+        |> peephole
+        |> remove_dead_after_jmp
+      in
+      if body' = body then body' else loop (iter + 1) body'
+  in
+  loop 0 body
+
+let optimize_func (f : func_ir) : func_ir =
+  { f with fir_body = optimize_func_body f.fir_body }
+
+let optimize_module (m : module_ir) : module_ir =
+  { m with mir_functions = List.map optimize_func m.mir_functions }

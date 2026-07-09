@@ -43,7 +43,8 @@ make clean && make
 ```
 ### 测试
 ```bash
-/toyc < test/02_add.tc > result/output.s   
+./toyc < test/02_add.tc > result/output.s   
+./toyc -opt < test/02_add.tc > result/output.s
 ```
 
 
