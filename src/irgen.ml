@@ -6,26 +6,45 @@ type ctx = {
   mutable next_reg : int;
   mutable instrs  : instr list;
   symtab          : symbol StringMap.t;
-  var_by_depth    : (int StringMap.t) list;
-  const_by_depth  : (int StringMap.t) list;
-  mutable scope_depth : int;
+  var_by_scope    : (int StringMap.t) list;
+  const_by_scope  : (int StringMap.t) list;
+  scope_parent    : int list;
+  mutable cur_scope : int;
+  mutable next_scope : int;
+  mutable hidden_local : (int * string) option;
   ret_type        : type_kind;
 }
 
 let sp = 0
 
-let rec scope_find name depth maps =
-  if depth < 0 then None
+let rec scope_find name scope_id maps scope_parent =
+  if scope_id < 0 then None
   else
-    match StringMap.find_opt name (List.nth maps depth) with
+    match StringMap.find_opt name (List.nth maps scope_id) with
     | Some _ as v -> v
-    | None -> scope_find name (depth - 1) maps
+    | None -> scope_find name (List.nth scope_parent scope_id) maps scope_parent
 
 let var_lookup ctx name =
-  scope_find name ctx.scope_depth ctx.var_by_depth
+  scope_find name ctx.cur_scope ctx.var_by_scope ctx.scope_parent
 
 let const_lookup ctx name =
-  scope_find name ctx.scope_depth ctx.const_by_depth
+  scope_find name ctx.cur_scope ctx.const_by_scope ctx.scope_parent
+
+type local_binding =
+  | LocalVar of int
+  | LocalConst of int
+
+let rec local_lookup ctx name scope_id =
+  if scope_id < 0 then None
+  else if ctx.hidden_local = Some (scope_id, name) then
+    local_lookup ctx name (List.nth ctx.scope_parent scope_id)
+  else
+    match StringMap.find_opt name (List.nth ctx.var_by_scope scope_id) with
+    | Some off -> Some (LocalVar off)
+    | None ->
+      (match StringMap.find_opt name (List.nth ctx.const_by_scope scope_id) with
+       | Some value -> Some (LocalConst value)
+       | None -> local_lookup ctx name (List.nth ctx.scope_parent scope_id))
 
 let new_reg ctx =
   let r = ctx.next_reg in
@@ -58,32 +77,36 @@ let rec eval_const (global_syms : symbol StringMap.t)
            | _ -> failwith ("not a compile-time constant: " ^ name))))
   | Binary (l, op, r) ->
     let vl = eval_const global_syms local_consts global_vals l in
-    let vr = eval_const global_syms local_consts global_vals r in
     (match op with
-     | Add -> vl + vr  | Sub -> vl - vr  | Mul -> vl * vr
-     | Div -> if vr = 0 then failwith "division by zero" else vl / vr
-     | Mod -> if vr = 0 then failwith "division by zero" else vl mod vr
-     | And -> if vl <> 0 && vr <> 0 then 1 else 0
-     | Or  -> if vl <> 0 || vr <> 0 then 1 else 0
-     | Eq  -> if vl = vr  then 1 else 0
-     | Neq -> if vl <> vr then 1 else 0
-     | Lt  -> if vl < vr  then 1 else 0
-     | Gt  -> if vl > vr  then 1 else 0
-     | Le  -> if vl <= vr then 1 else 0
-     | Ge  -> if vl >= vr then 1 else 0)
+     | And -> if vl = 0 then 0 else if eval_const global_syms local_consts global_vals r <> 0 then 1 else 0
+     | Or  -> if vl <> 0 then 1 else if eval_const global_syms local_consts global_vals r <> 0 then 1 else 0
+     | _ ->
+       let vr = eval_const global_syms local_consts global_vals r in
+       match op with
+       | Add -> vl + vr  | Sub -> vl - vr  | Mul -> vl * vr
+       | Div -> if vr = 0 then failwith "division by zero" else vl / vr
+       | Mod -> if vr = 0 then failwith "division by zero" else vl mod vr
+       | Eq  -> if vl = vr  then 1 else 0
+       | Neq -> if vl <> vr then 1 else 0
+       | Lt  -> if vl < vr  then 1 else 0
+       | Gt  -> if vl > vr  then 1 else 0
+       | Le  -> if vl <= vr then 1 else 0
+       | Ge  -> if vl >= vr then 1 else 0
+       | And | Or -> assert false)
   | Unary (op, e) ->
     let v = eval_const global_syms local_consts global_vals e in
     (match op with Neg -> -v | Pos -> v | Not -> if v = 0 then 1 else 0)
   | Call _ -> failwith "function call in const expression"
 
 let frame_info (global_syms : symbol StringMap.t) (params : param list)
-    (body : stmt) : (int StringMap.t) list * (int StringMap.t) list * int =
+    (body : stmt) : (int StringMap.t) list * (int StringMap.t) list * int list * int =
   let var_maps = ref [StringMap.empty] in
   let const_maps = ref [StringMap.empty] in
-  let cur_depth = ref 0 in
+  let scope_parent = ref [(-1)] in
+  let cur_scope = ref 0 in
   let next_off = ref 4 in
   let add_entry maps_ref name value =
-    let idx = !cur_depth in
+    let idx = !cur_scope in
     while List.length !maps_ref <= idx do
       maps_ref := !maps_ref @ [StringMap.empty]
     done;
@@ -97,21 +120,40 @@ let frame_info (global_syms : symbol StringMap.t) (params : param list)
   and add_const name v =
     add_entry const_maps name v
   in
+  let visible_consts () =
+    let rec scope_chain scope_id =
+      if scope_id < 0 then []
+      else scope_chain (List.nth !scope_parent scope_id) @ [scope_id]
+    in
+    List.fold_left (fun values scope_id ->
+      let values =
+        StringMap.fold (fun name _ acc -> StringMap.remove name acc)
+          (List.nth !var_maps scope_id) values
+      in
+      StringMap.fold StringMap.add (List.nth !const_maps scope_id) values
+    ) StringMap.empty (scope_chain !cur_scope)
+  in
   List.iter (fun p -> add_var p.p_name) params;
   let rec walk s = match s with
     | Block stmts ->
-      cur_depth := !cur_depth + 1;
-      while List.length !var_maps <= !cur_depth do
+      let parent = !cur_scope in
+      cur_scope := List.length !var_maps;
+      while List.length !scope_parent <= !cur_scope do
+        scope_parent := !scope_parent @ [(-1)]
+      done;
+      scope_parent := List.mapi (fun i p ->
+        if i = !cur_scope then parent else p
+      ) !scope_parent;
+      while List.length !var_maps <= !cur_scope do
         var_maps := !var_maps @ [StringMap.empty];
         const_maps := !const_maps @ [StringMap.empty]
       done;
       List.iter walk stmts;
-      cur_depth := !cur_depth - 1
+      cur_scope := parent
     | If (_, th, el) -> walk th; Option.iter walk el
     | While (_, body) -> walk body
     | Decl (ConstDecl (name, init)) ->
-      let cur_consts = List.nth !const_maps !cur_depth in
-      let v = eval_const global_syms cur_consts StringMap.empty init in
+      let v = eval_const global_syms (visible_consts ()) StringMap.empty init in
       add_const name v
     | Decl (VarDecl (name, _)) ->
       add_var name
@@ -124,7 +166,7 @@ let frame_info (global_syms : symbol StringMap.t) (params : param list)
   List.iter walk body_stmts;
   let total = !next_off in
   let aligned = (total + 15) / 16 * 16 in
-  (!var_maps, !const_maps, aligned)
+  (!var_maps, !const_maps, !scope_parent, aligned)
 
 let rec gen_expr (ctx : ctx) (e : exp) : vreg =
   match e with
@@ -133,30 +175,28 @@ let rec gen_expr (ctx : ctx) (e : exp) : vreg =
     emit ctx (Li (r, n));
     r
   | Id name ->
-    (match const_lookup ctx name with
-     | Some v ->
+    (match local_lookup ctx name ctx.cur_scope with
+     | Some (LocalConst v) ->
        let r = new_reg ctx in
        emit ctx (Li (r, v));
        r
+     | Some (LocalVar off) ->
+       let r = new_reg ctx in
+       emit ctx (Lw (r, sp, off));
+       r
      | None ->
-       (match var_lookup ctx name with
-        | Some off ->
+       (match StringMap.find_opt name ctx.symtab with
+        | Some (SymConst v) ->
           let r = new_reg ctx in
-          emit ctx (Lw (r, sp, off));
+          emit ctx (Li (r, v));
           r
-        | None ->
-           (match StringMap.find_opt name ctx.symtab with
-            | Some (SymConst v) | Some (SymVarVal v) ->
-              let r = new_reg ctx in
-              emit ctx (Li (r, v));
-              r
-            | Some SymVar ->
-              let addr_r = new_reg ctx in
-              let r = new_reg ctx in
-              emit ctx (La (addr_r, name));
-              emit ctx (Lw (r, addr_r, 0));
-              r
-           | _ -> failwith ("undefined variable '" ^ name ^ "'"))))
+        | Some SymVar | Some (SymVarVal _) ->
+          let addr_r = new_reg ctx in
+          let r = new_reg ctx in
+          emit ctx (La (addr_r, name));
+          emit ctx (Lw (r, addr_r, 0));
+          r
+        | _ -> failwith ("undefined variable '" ^ name ^ "'")))
   | Unary (op, e) ->
     let r = gen_expr ctx e in
     let rd = new_reg ctx in
@@ -214,18 +254,22 @@ let rec gen_stmt (ctx : ctx) (brk_lbl : string) (cnt_lbl : string)
     (s : stmt) : unit =
   match s with
   | Block stmts ->
-    ctx.scope_depth <- ctx.scope_depth + 1;
+    let parent_scope = ctx.cur_scope in
+    ctx.cur_scope <- ctx.next_scope;
+    ctx.next_scope <- ctx.next_scope + 1;
     List.iter (gen_stmt ctx brk_lbl cnt_lbl) stmts;
-    ctx.scope_depth <- ctx.scope_depth - 1
+    ctx.cur_scope <- parent_scope
   | Empty -> ()
   | Expr e ->
     ignore (gen_expr ctx e)
   | Assign (name, e) ->
     let r = gen_expr ctx e in
-    (match var_lookup ctx name with
-     | Some off ->
+    (match local_lookup ctx name ctx.cur_scope with
+     | Some (LocalVar off) ->
        emit ctx (Sw (sp, off, VReg r))
-      | None ->
+     | Some (LocalConst _) ->
+       failwith ("cannot assign to const '" ^ name ^ "'")
+     | None ->
         (match StringMap.find_opt name ctx.symtab with
          | Some SymVar | Some (SymVarVal _) ->
            let addr_r = new_reg ctx in
@@ -269,7 +313,19 @@ let rec gen_stmt (ctx : ctx) (brk_lbl : string) (cnt_lbl : string)
   | Decl (ConstDecl (_, _)) ->
     ()
   | Decl (VarDecl (name, init)) ->
-    let r = gen_expr ctx init in
+    (* A declaration is not visible inside its own initializer.  This matters
+       for `int x = x + 1` in a scope that shadows an outer x. *)
+    let old_hidden = ctx.hidden_local in
+    ctx.hidden_local <- Some (ctx.cur_scope, name);
+    let r =
+      try
+        let value = gen_expr ctx init in
+        ctx.hidden_local <- old_hidden;
+        value
+      with exn ->
+        ctx.hidden_local <- old_hidden;
+        raise exn
+    in
     let off =
       match var_lookup ctx name with
       | Some o -> o
@@ -278,7 +334,7 @@ let rec gen_stmt (ctx : ctx) (brk_lbl : string) (cnt_lbl : string)
     emit ctx (Sw (sp, off, VReg r))
 
 let gen_func (global_syms : symbol StringMap.t) (f : func_def) : func_ir =
-  let var_maps, const_maps, stack_sz =
+  let var_maps, const_maps, scope_parent, stack_sz =
     frame_info global_syms f.params f.body in
   let next_reg = ref (1 + List.length f.params) in
   let instrs = ref [] in
@@ -301,9 +357,12 @@ let gen_func (global_syms : symbol StringMap.t) (f : func_def) : func_ir =
     next_reg = !next_reg;
     instrs  = !instrs;
     symtab  = global_syms;
-    var_by_depth = var_maps;
-    const_by_depth = const_maps;
-    scope_depth = 0;
+    var_by_scope = var_maps;
+    const_by_scope = const_maps;
+    scope_parent;
+    cur_scope = 0;
+    next_scope = 1;
+    hidden_local = None;
     ret_type = f.ret_type;
   } in
   (match f.body with

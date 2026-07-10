@@ -1,0 +1,13 @@
+const int safe_and = 0 && (1 / 0);
+const int safe_or = 1 || (1 / 0);
+
+int main() {
+  const int outer = 20;
+  int result = 0;
+  {
+    const int inner = outer + 1;
+    int outer = 100;
+    result = inner + outer;
+  }
+  return result + safe_and + safe_or;
+}

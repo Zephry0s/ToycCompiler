@@ -1,0 +1,19 @@
+int main() {
+  int result = 0;
+  {
+    int left = 10;
+    result = result + left;
+  }
+  {
+    int right = 20;
+    result = result + right;
+  }
+  if (result == 30) {
+    int nested = 12;
+    result = result + nested;
+  } else {
+    int fallback = 100;
+    result = fallback;
+  }
+  return result;
+}

@@ -14,7 +14,7 @@ rule token = parse
   | '\n'         { Lexing.new_line lexbuf; token lexbuf }
 
   | "//"         { line_comment lexbuf }
-  | "/*"         { block_comment 0 lexbuf }
+  | "/*"         { block_comment lexbuf }
 
   | "const"      { CONST }
   | "int"        { INT }
@@ -68,10 +68,8 @@ and line_comment = parse
   | eof   { EOF }
   | _     { line_comment lexbuf }
 
-and block_comment depth = parse
-  | "/*"  { block_comment (depth + 1) lexbuf }
-  | "*/"  { if depth = 0 then token lexbuf
-            else block_comment (depth - 1) lexbuf }
-  | '\n'  { Lexing.new_line lexbuf; block_comment depth lexbuf }
+and block_comment = parse
+  | "*/"  { token lexbuf }
+  | '\n'  { Lexing.new_line lexbuf; block_comment lexbuf }
   | eof   { raise (LexError "unterminated block comment") }
-  | _     { block_comment depth lexbuf }
+  | _     { block_comment lexbuf }

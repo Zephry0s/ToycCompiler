@@ -1,0 +1,16 @@
+int seed = 4;
+
+/* A C comment ends at the first terminator, even if it contains /* text. */
+int main() {
+  int value = seed;
+  {
+    int value = value + 3;
+    const int saved = 2;
+    {
+      int saved = value + saved;
+      value = +saved;
+    }
+    seed = value;
+  }
+  return seed;
+}

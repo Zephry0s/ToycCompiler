@@ -1,0 +1,22 @@
+int counter = 1;
+
+void bump() {
+  counter = counter + 4;
+  return;
+}
+
+int countdown(int n) {
+  if (n == 0)
+    return counter;
+  counter = counter + 1;
+  return countdown(n - 1);
+}
+
+int main() {
+  bump();
+  if (0 && countdown(10))
+    counter = 100;
+  if (1 || countdown(10))
+    counter = counter + 2;
+  return countdown(3);
+}
