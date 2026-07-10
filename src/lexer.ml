@@ -1095,7 +1095,7 @@ and __ocaml_lex_block_comment_rec depth lexbuf __ocaml_lex_state =
   match Lexing.engine __ocaml_lex_tables __ocaml_lex_state lexbuf with
       | 0 ->
 # 72 "lexer.mll"
-          ( block_comment (depth + 1) lexbuf )
+          ( block_comment depth lexbuf )
 # 1100 "lexer.ml"
 
   | 1 ->

@@ -11,6 +11,7 @@ type ctx = {
   scope_parent    : int list;
   mutable cur_scope : int;
   mutable next_scope : int;
+  mutable hidden_local : (int * string) option;
   ret_type        : type_kind;
 }
 
@@ -35,6 +36,8 @@ type local_binding =
 
 let rec local_lookup ctx name scope_id =
   if scope_id < 0 then None
+  else if ctx.hidden_local = Some (scope_id, name) then
+    local_lookup ctx name (List.nth ctx.scope_parent scope_id)
   else
     match StringMap.find_opt name (List.nth ctx.var_by_scope scope_id) with
     | Some off -> Some (LocalVar off)
@@ -183,11 +186,11 @@ let rec gen_expr (ctx : ctx) (e : exp) : vreg =
        r
      | None ->
        (match StringMap.find_opt name ctx.symtab with
-        | Some (SymConst v) | Some (SymVarVal v) ->
+        | Some (SymConst v) ->
           let r = new_reg ctx in
           emit ctx (Li (r, v));
           r
-        | Some SymVar ->
+        | Some SymVar | Some (SymVarVal _) ->
           let addr_r = new_reg ctx in
           let r = new_reg ctx in
           emit ctx (La (addr_r, name));
@@ -310,7 +313,19 @@ let rec gen_stmt (ctx : ctx) (brk_lbl : string) (cnt_lbl : string)
   | Decl (ConstDecl (_, _)) ->
     ()
   | Decl (VarDecl (name, init)) ->
-    let r = gen_expr ctx init in
+    (* A declaration is not visible inside its own initializer.  This matters
+       for `int x = x + 1` in a scope that shadows an outer x. *)
+    let old_hidden = ctx.hidden_local in
+    ctx.hidden_local <- Some (ctx.cur_scope, name);
+    let r =
+      try
+        let value = gen_expr ctx init in
+        ctx.hidden_local <- old_hidden;
+        value
+      with exn ->
+        ctx.hidden_local <- old_hidden;
+        raise exn
+    in
     let off =
       match var_lookup ctx name with
       | Some o -> o
@@ -347,6 +362,7 @@ let gen_func (global_syms : symbol StringMap.t) (f : func_def) : func_ir =
     scope_parent;
     cur_scope = 0;
     next_scope = 1;
+    hidden_local = None;
     ret_type = f.ret_type;
   } in
   (match f.body with
