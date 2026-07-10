@@ -77,12 +77,16 @@ let split_blocks (instrs : instr list) : instr list list =
 (* --- Value substitution for copy propagation --- *)
 
 let rec subst_val (subst : (vreg, value) Hashtbl.t) (v : value) : value =
+  subst_val_depth 0 subst v
+
+and subst_val_depth (depth : int) (subst : (vreg, value) Hashtbl.t) (v : value) : value =
+  if depth > 5 then v else
   match v with
   | VImm _ -> v
   | VReg r when r = 0 -> v
   | VReg r ->
     match Hashtbl.find_opt subst r with
-    | Some v' -> subst_val subst v'
+    | Some v' -> subst_val_depth (depth + 1) subst v'
     | None -> v
 
 let subst_base (subst : (vreg, value) Hashtbl.t) (base : vreg) : vreg =
@@ -147,10 +151,14 @@ let copy_prop_block (instrs : instr list) : instr list =
   let result = List.map (fun i ->
     let i' = subst_instr subst i in
     if i' <> i then changed := true;
-    (match i' with
-     | Mov (rd, v) -> Hashtbl.replace subst rd v
-     | Li (rd, n) -> Hashtbl.replace subst rd (VImm n)
-     | _ -> ());
+    (match def_vreg i' with
+     | Some rd ->
+       Hashtbl.remove subst rd;
+       (match i' with
+        | Mov (_, v) when not (has_side_effect i') -> Hashtbl.replace subst rd v
+        | Li (_, n) when not (has_side_effect i') -> Hashtbl.replace subst rd (VImm n)
+        | _ -> ())
+     | None -> ());
     i'
   ) instrs in
   if !changed then result else instrs
@@ -216,7 +224,7 @@ let rec peephole_scan (acc : instr list) (instrs : instr list) : instr list =
      | _ -> peephole_scan (Bz (VReg r, lbl) :: li :: acc) rest)
   | (Li _ as li) :: (Bnz (VReg r, lbl)) :: rest ->
     (match li with
-     | Li (rd, 1) when rd = r -> peephole_scan (li :: acc) (Jmp lbl :: rest)
+     | Li (rd, n) when rd = r && n <> 0 -> peephole_scan (li :: acc) (Jmp lbl :: rest)
      | Li (rd, 0) when rd = r -> peephole_scan (li :: acc) rest
      | _ -> peephole_scan (Bnz (VReg r, lbl) :: li :: acc) rest)
   | Bz (VImm 0, lbl) :: rest -> peephole_scan acc (Jmp lbl :: rest)
@@ -317,8 +325,7 @@ let cse_func (f : func_ir) : func_ir =
          | None   -> Hashtbl.replace tbl key rd; instr)
       | Sw (0, off, _) ->
         invalidate_lw off; instr
-      | Label _ ->
-        (* basic-block boundary: reset available expressions *)
+      | Call _ | Jmp _ | Label _ ->
         Hashtbl.reset tbl; instr
       | _ -> instr
     ) f.fir_body

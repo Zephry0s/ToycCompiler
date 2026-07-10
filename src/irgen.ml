@@ -6,23 +6,27 @@ type ctx = {
   mutable next_reg : int;
   mutable instrs  : instr list;
   symtab          : symbol StringMap.t;
-  var_by_depth    : int StringMap.t list;
-  const_by_depth  : int StringMap.t list;
-  mutable scope_depth : int;
+  var_by_scope    : (int StringMap.t) list;
+  const_by_scope  : (int StringMap.t) list;
+  scope_parent    : int list;
+  mutable cur_scope : int;
   ret_type        : type_kind;
 }
 
 let sp = 0
 
-let rec scope_find name depth maps =
-  if depth < 0 then None
+let rec scope_find name scope_id maps scope_parent =
+  if scope_id < 0 then None
   else
-    match StringMap.find_opt name (List.nth maps depth) with
+    match StringMap.find_opt name (List.nth maps scope_id) with
     | Some _ as v -> v
-    | None -> scope_find name (depth - 1) maps
+    | None -> scope_find name (List.nth scope_parent scope_id) maps scope_parent
 
-let var_lookup ctx name = scope_find name ctx.scope_depth ctx.var_by_depth
-let const_lookup ctx name = scope_find name ctx.scope_depth ctx.const_by_depth
+let var_lookup ctx name =
+  scope_find name ctx.cur_scope ctx.var_by_scope ctx.scope_parent
+
+let const_lookup ctx name =
+  scope_find name ctx.cur_scope ctx.const_by_scope ctx.scope_parent
 
 let new_reg ctx =
   let r = ctx.next_reg in
@@ -74,18 +78,14 @@ let rec eval_const (global_syms : symbol StringMap.t)
   | Call _ -> failwith "function call in const expression"
 
 let frame_info (global_syms : symbol StringMap.t) (params : param list)
-    (body : stmt) : (int StringMap.t) list * (int StringMap.t) list * int =
-  let var_by_depth = ref [StringMap.empty] in
-  let const_by_depth = ref [StringMap.empty] in
-  let cur_depth = ref 0 in
+    (body : stmt) : (int StringMap.t) list * (int StringMap.t) list * int list * int =
+  let var_maps = ref [StringMap.empty] in
+  let const_maps = ref [StringMap.empty] in
+  let scope_parent = ref [(-1)] in
+  let cur_scope = ref 0 in
   let next_off = ref 4 in
-  let rec add_var name =
-    add_to_depth var_by_depth name !next_off;
-    next_off := !next_off + 4
-  and add_const name v =
-    add_to_depth const_by_depth name v
-  and add_to_depth maps_ref name value =
-    let idx = !cur_depth in
+  let add_entry maps_ref name value =
+    let idx = !cur_scope in
     while List.length !maps_ref <= idx do
       maps_ref := !maps_ref @ [StringMap.empty]
     done;
@@ -93,22 +93,33 @@ let frame_info (global_syms : symbol StringMap.t) (params : param list)
       if i = idx then StringMap.add name value m else m
     ) !maps_ref
   in
-  List.iter (fun p ->
-    add_var p.p_name
-  ) params;
+  let add_var name =
+    add_entry var_maps name !next_off;
+    next_off := !next_off + 4
+  and add_const name v =
+    add_entry const_maps name v
+  in
+  List.iter (fun p -> add_var p.p_name) params;
   let rec walk s = match s with
     | Block stmts ->
-      cur_depth := !cur_depth + 1;
-      while List.length !var_by_depth <= !cur_depth do
-        var_by_depth := !var_by_depth @ [StringMap.empty];
-        const_by_depth := !const_by_depth @ [StringMap.empty]
+      let parent = !cur_scope in
+      cur_scope := List.length !var_maps;
+      while List.length !scope_parent <= !cur_scope do
+        scope_parent := !scope_parent @ [(-1)]
+      done;
+      scope_parent := List.mapi (fun i p ->
+        if i = !cur_scope then parent else p
+      ) !scope_parent;
+      while List.length !var_maps <= !cur_scope do
+        var_maps := !var_maps @ [StringMap.empty];
+        const_maps := !const_maps @ [StringMap.empty]
       done;
       List.iter walk stmts;
-      cur_depth := !cur_depth - 1
+      cur_scope := parent
     | If (_, th, el) -> walk th; Option.iter walk el
     | While (_, body) -> walk body
     | Decl (ConstDecl (name, init)) ->
-      let cur_consts = List.nth !const_by_depth !cur_depth in
+      let cur_consts = List.nth !const_maps !cur_scope in
       let v = eval_const global_syms cur_consts StringMap.empty init in
       add_const name v
     | Decl (VarDecl (name, _)) ->
@@ -122,7 +133,7 @@ let frame_info (global_syms : symbol StringMap.t) (params : param list)
   List.iter walk body_stmts;
   let total = !next_off in
   let aligned = (total + 15) / 16 * 16 in
-  (!var_by_depth, !const_by_depth, aligned)
+  (!var_maps, !const_maps, !scope_parent, aligned)
 
 let rec gen_expr (ctx : ctx) (e : exp) : vreg =
   match e with
@@ -212,9 +223,9 @@ let rec gen_stmt (ctx : ctx) (brk_lbl : string) (cnt_lbl : string)
     (s : stmt) : unit =
   match s with
   | Block stmts ->
-    ctx.scope_depth <- ctx.scope_depth + 1;
+    ctx.cur_scope <- ctx.cur_scope + 1;
     List.iter (gen_stmt ctx brk_lbl cnt_lbl) stmts;
-    ctx.scope_depth <- ctx.scope_depth - 1
+    ctx.cur_scope <- List.nth ctx.scope_parent ctx.cur_scope
   | Empty -> ()
   | Expr e ->
     ignore (gen_expr ctx e)
@@ -276,7 +287,7 @@ let rec gen_stmt (ctx : ctx) (brk_lbl : string) (cnt_lbl : string)
     emit ctx (Sw (sp, off, VReg r))
 
 let gen_func (global_syms : symbol StringMap.t) (f : func_def) : func_ir =
-  let var_by_depth, const_by_depth, stack_sz =
+  let var_maps, const_maps, scope_parent, stack_sz =
     frame_info global_syms f.params f.body in
   let next_reg = ref (1 + List.length f.params) in
   let instrs = ref [] in
@@ -285,7 +296,7 @@ let gen_func (global_syms : symbol StringMap.t) (f : func_def) : func_ir =
   in
   let all_vars = List.fold_left (fun acc m ->
     StringMap.fold (fun name off acc2 -> (name, off) :: acc2) m acc
-  ) [] var_by_depth in
+  ) [] var_maps in
   let local_list =
     List.filter (fun (name, _) ->
       not (List.exists (fun (pn, _) -> pn = name) param_list))
@@ -299,9 +310,10 @@ let gen_func (global_syms : symbol StringMap.t) (f : func_def) : func_ir =
     next_reg = !next_reg;
     instrs  = !instrs;
     symtab  = global_syms;
-    var_by_depth;
-    const_by_depth;
-    scope_depth = 0;
+    var_by_scope = var_maps;
+    const_by_scope = const_maps;
+    scope_parent;
+    cur_scope = 0;
     ret_type = f.ret_type;
   } in
   (match f.body with
