@@ -74,7 +74,7 @@ let rec is_const_expr (st : scope_stack) (e : exp) : bool =
   | Num _ -> true
   | Id name ->
     (match lookup st name with
-     | Some (SymConst _) | Some SymVar -> true
+      | Some (SymConst _) -> true
      | _ -> false)
   | Binary (l, _, r) -> is_const_expr st l && is_const_expr st r
   | Unary (_, e) -> is_const_expr st e
