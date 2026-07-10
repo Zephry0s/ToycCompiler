@@ -193,6 +193,7 @@ let compute_intervals (instr_arr : instr array) (bb_arr : bb array)
     (live_in : ISet.t array) (live_out : ISet.t array) =
   let first_def = ref IMap.empty in
   let last_use = ref IMap.empty in
+  let call_positions = ref ISet.empty in
 
   for bid = 0 to Array.length bb_arr - 1 do
     let bb = bb_arr.(bid) in
@@ -201,6 +202,16 @@ let compute_intervals (instr_arr : instr array) (bb_arr : bb array)
     let rec walk idx =
       if idx >= bb.bb_start then begin
         let inst = instr_arr.(idx) in
+
+        (match inst with
+         | Call _ -> call_positions := ISet.add idx !call_positions
+         | _ -> ());
+
+        let live_set = match def_opt inst with
+          | Some r -> ISet.remove r !live
+          | None -> !live
+        in
+        live := ISet.union live_set (use_set inst);
 
         ISet.iter (fun r ->
           if r <> 0 then
@@ -214,12 +225,6 @@ let compute_intervals (instr_arr : instr array) (bb_arr : bb array)
              match old with Some v -> Some (min v idx) | None -> Some idx) !first_def
          | _ -> ());
 
-        let live_set = match def_opt inst with
-          | Some r -> ISet.remove r !live
-          | None -> !live
-        in
-        live := ISet.union live_set (use_set inst);
-
         walk (idx - 1)
       end
     in
@@ -232,11 +237,11 @@ let compute_intervals (instr_arr : instr array) (bb_arr : bb array)
         first_def := IMap.add r 0 !first_def
     ) live_in.(0);
 
-  (!first_def, !last_use)
+  (!first_def, !last_use, !call_positions)
 
 (* ---------- linear scan ---------- *)
 
-let linear_scan (first_def : int IMap.t) (last_use : int IMap.t) : func_alloc =
+let linear_scan (first_def : int IMap.t) (last_use : int IMap.t) (call_positions : ISet.t) : func_alloc =
   let intervals = ref [] in
   IMap.iter (fun vreg start ->
     let last = match IMap.find_opt vreg last_use with
@@ -248,16 +253,29 @@ let linear_scan (first_def : int IMap.t) (last_use : int IMap.t) : func_alloc =
 
   let intervals = List.sort (fun a b -> compare a.i_start b.i_start) !intervals in
 
+  let spans_call iv =
+    try
+      let _ = ISet.find_first (fun pos -> pos >= iv.i_start && pos <= iv.i_end) call_positions in
+      true
+    with Not_found -> false
+  in
+
+  let is_caller_saved r =
+    String.length r > 0 && r.[0] = 't'
+  in
+
   let reg_map = Hashtbl.create 64 in
   let callee_used = ref [] in
 
   let active = Array.make num_regs (None : (int * int) option) in
   let next_spill = ref 0 in
 
-  let find_free () =
+  let find_free ?(avoid_caller_saved = false) () =
     let rec loop i =
       if i >= num_regs then None
-      else if active.(i) = None then Some i
+      else if active.(i) = None then
+        if avoid_caller_saved && is_caller_saved phys_regs.(i) then loop (i + 1)
+        else Some i
       else loop (i + 1)
     in loop 0
   in
@@ -273,7 +291,16 @@ let linear_scan (first_def : int IMap.t) (last_use : int IMap.t) : func_alloc =
   List.iter (fun iv ->
     expire_active iv.i_start;
 
-    match find_free () with
+    let need_callee = spans_call iv in
+    let idx =
+      match find_free ~avoid_caller_saved:need_callee () with
+      | Some i -> Some i
+      | None when need_callee ->
+        find_free ()
+      | None -> None
+    in
+
+    (match idx with
     | Some idx ->
       active.(idx) <- Some (iv.i_vreg, iv.i_end);
       Hashtbl.replace reg_map iv.i_vreg (Reg phys_regs.(idx));
@@ -306,6 +333,7 @@ let linear_scan (first_def : int IMap.t) (last_use : int IMap.t) : func_alloc =
         Hashtbl.replace reg_map iv.i_vreg (Spill off);
         next_spill := !next_spill + 4
       end
+    )
   ) intervals;
 
   IMap.iter (fun vreg _ ->
@@ -324,5 +352,5 @@ let alloc_func (f : func_ir) : func_alloc =
   let instr_arr, bb_arr = build_blocks f.fir_body in
   let use_arr, def_arr = compute_use_def instr_arr bb_arr in
   let live_in, live_out = compute_liveness bb_arr use_arr def_arr in
-  let first_def, last_use = compute_intervals instr_arr bb_arr live_in live_out in
-  linear_scan first_def last_use
+  let first_def, last_use, call_positions = compute_intervals instr_arr bb_arr live_in live_out in
+  linear_scan first_def last_use call_positions
