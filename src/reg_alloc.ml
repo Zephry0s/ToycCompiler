@@ -19,9 +19,11 @@ type alloc =
   | Spill of int
 
 type func_alloc = {
-  fa_reg_map     : (int, alloc) Hashtbl.t;
-  fa_callee_used : string list;
-  fa_spill_sz    : int;
+  fa_reg_map               : (int, alloc) Hashtbl.t;
+  fa_callee_used           : string list;
+  fa_spill_sz              : int;
+  fa_caller_save_sz        : int;
+  fa_caller_saved_at_call  : (int, string list) Hashtbl.t;
 }
 
 (* ---------- use/def per instruction ---------- *)
@@ -344,9 +346,32 @@ let linear_scan (first_def : int IMap.t) (last_use : int IMap.t) (call_positions
     end
   ) first_def;
 
-  { fa_reg_map     = reg_map;
-    fa_callee_used = !callee_used;
-    fa_spill_sz    = !next_spill }
+  let caller_saved_at_call = Hashtbl.create 8 in
+  ISet.iter (fun call_pos ->
+    let regs_to_save = ref [] in
+    List.iter (fun iv ->
+      if iv.i_start < call_pos && call_pos <= iv.i_end then
+        match Hashtbl.find_opt reg_map iv.i_vreg with
+        | Some (Reg r) when is_caller_saved r ->
+          if not (List.mem r !regs_to_save) then
+            regs_to_save := r :: !regs_to_save
+        | _ -> ()
+    ) intervals;
+    if !regs_to_save <> [] then
+      Hashtbl.replace caller_saved_at_call call_pos !regs_to_save
+  ) call_positions;
+
+  let caller_save_sz =
+    Hashtbl.fold (fun _ regs max_sz ->
+      max max_sz (List.length regs * 4)
+    ) caller_saved_at_call 0
+  in
+
+  { fa_reg_map               = reg_map;
+    fa_callee_used           = !callee_used;
+    fa_spill_sz              = !next_spill;
+    fa_caller_save_sz        = caller_save_sz;
+    fa_caller_saved_at_call  = caller_saved_at_call }
 
 let alloc_func (f : func_ir) : func_alloc =
   let instr_arr, bb_arr = build_blocks f.fir_body in

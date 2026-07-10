@@ -360,6 +360,4 @@ let comp_unit token_fun lexbuf =
       parse_error st "expected end of file";
     ast
   with Error msg ->
-    let line = pos_line st in
-    let col = pos_col st in
-    raise (Error (Printf.sprintf "line %d, col %d: %s" line col msg))
+    raise (Error msg)
