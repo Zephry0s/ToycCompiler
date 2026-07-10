@@ -207,7 +207,8 @@ let emit_func buf f (fa : func_alloc) =
 
   let ret_label = "." ^ f.fir_name ^ "_ret" in
 
-  Buffer.add_string buf (Printf.sprintf "\n  .globl %s\n" f.fir_name);
+  if f.fir_name = "main" then
+    Buffer.add_string buf (Printf.sprintf "\n  .globl %s\n" f.fir_name);
   Buffer.add_string buf (Printf.sprintf "%s:\n" f.fir_name);
   Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" (-total_frame));
   Buffer.add_string buf (Printf.sprintf "  sw ra, %d(sp)\n" ra_off);
@@ -261,7 +262,7 @@ let emit_func buf f (fa : func_alloc) =
     ) fa.fa_callee_used;
     Buffer.add_string buf (Printf.sprintf "  lw ra, %d(sp)\n" ra_off);
     Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" total_frame);
-    Buffer.add_string buf "  li a7, 10\n";
+    Buffer.add_string buf "  li a7, 93\n";
     Buffer.add_string buf "  ecall\n"
   end else begin
     List.iteri (fun i reg ->
