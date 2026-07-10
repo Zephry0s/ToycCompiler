@@ -154,9 +154,14 @@ let emit_one buf spill_base reg_map = function
   | Call (rd, fname, args) ->
     let n_args = List.length args in
     let excess = if n_args > 8 then n_args - 8 else 0 in
-    let call_spill_base = spill_base + excess * 4 in
+    let caller_save_sz = 20 in
+    let call_spill_base = spill_base + excess * 4 + caller_save_sz in
+    let adj = excess * 4 + caller_save_sz in
+    Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" (-adj));
+    List.iteri (fun i reg ->
+      Buffer.add_string buf (Printf.sprintf "  sw %s, %d(sp)\n" reg (excess * 4 + i * 4))
+    ) ["t0"; "t1"; "t2"; "t3"; "t4"];
     if excess > 0 then begin
-      Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" (-(excess * 4)));
       let rec copy_excess i arg_list =
         match arg_list with
         | [] -> ()
@@ -182,8 +187,11 @@ let emit_one buf spill_base reg_map = function
     let (dst, st) = resolve_dst reg_map call_spill_base spill_temp1 rd in
     Buffer.add_string buf (Printf.sprintf "  mv %s, a0\n" dst);
     Buffer.add_string buf st;
-    if excess > 0 then
-      Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" (excess * 4))
+    List.iteri (fun i reg ->
+      if reg <> dst then
+        Buffer.add_string buf (Printf.sprintf "  lw %s, %d(sp)\n" reg (excess * 4 + i * 4))
+    ) ["t0"; "t1"; "t2"; "t3"; "t4"];
+    Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" adj)
   | Ret _ -> ()
   | Jmp label ->
     Buffer.add_string buf (Printf.sprintf "  j %s\n" label)

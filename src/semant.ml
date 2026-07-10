@@ -4,6 +4,7 @@ module StringMap = Map.Make (String)
 
 type symbol =
   | SymVar
+  | SymVarVal of int
   | SymConst of int
   | SymParam
   | SymFunc of func_info
@@ -41,7 +42,7 @@ let rec try_eval_const (st : scope_stack) (e : exp) : int =
   | Num n -> n
   | Id name ->
     (match lookup st name with
-     | Some (SymConst v) -> v
+     | Some (SymConst v) | Some (SymVarVal v) -> v
      | _ -> failwith ("not a compile-time constant: " ^ name))
   | Binary (l, op, r) ->
     let vl = try_eval_const st l in
@@ -73,9 +74,9 @@ let rec is_const_expr (st : scope_stack) (e : exp) : bool =
   match e with
   | Num _ -> true
   | Id name ->
-    (match lookup st name with
-      | Some (SymConst _) -> true
-     | _ -> false)
+     (match lookup st name with
+      | Some (SymConst _) | Some (SymVarVal _) | Some SymVar -> true
+      | _ -> false)
   | Binary (l, _, r) -> is_const_expr st l && is_const_expr st r
   | Unary (_, e) -> is_const_expr st e
   | Call _ -> false
@@ -108,7 +109,7 @@ and check_exp (st : scope_stack) (e : exp) : type_kind =
   | Num _ -> Int
   | Id name ->
     (match lookup st name with
-     | Some (SymVar | SymParam | SymConst _) -> Int
+     | Some (SymVar | SymVarVal _ | SymParam | SymConst _) -> Int
      | Some (SymFunc _) -> failwith ("function '" ^ name ^ "' used as value")
      | None -> failwith ("undefined identifier '" ^ name ^ "'"))
   | Unary (_, e) ->
@@ -149,7 +150,7 @@ and check_stmt (st : scope_stack) (in_loop : bool) (ret_type : type_kind)
     (match lookup st name with
      | Some (SymConst _) -> failwith ("cannot assign to const '" ^ name ^ "'")
      | Some (SymFunc _) -> failwith ("function '" ^ name ^ "' is not assignable")
-     | Some (SymVar | SymParam) -> st
+      | Some (SymVar | SymVarVal _ | SymParam) -> st
      | None -> failwith ("undefined variable '" ^ name ^ "'"))
   | If (cond, th, el) ->
     ignore (check_cond st cond);
@@ -196,7 +197,10 @@ let check_top_decl (st : scope_stack) (d : decl) : scope_stack =
   | VarDecl (name, init) ->
     if not (is_const_expr st init) then
       failwith ("global variable '" ^ name ^ "' initializer must be compile-time constant");
-    check_decl st d
+    let v = try_eval_const st init in
+    let t = check_exp st init in
+    if t = Void then failwith ("variable '" ^ name ^ "' cannot be initialized with void function call");
+    add_symbol st name (SymVarVal v)
   | _ -> check_decl st d
 
 let check_func_body (global_st : scope_stack) (f : func_def) : unit =
