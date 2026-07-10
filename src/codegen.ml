@@ -154,13 +154,14 @@ let emit_one buf spill_base reg_map = function
   | Call (rd, fname, args) ->
     let n_args = List.length args in
     let excess = if n_args > 8 then n_args - 8 else 0 in
+    let call_spill_base = spill_base + excess * 4 in
     if excess > 0 then begin
       Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" (-(excess * 4)));
       let rec copy_excess i arg_list =
         match arg_list with
         | [] -> ()
         | v :: rst when i >= 8 ->
-          let (rv, lv) = resolve_src reg_map spill_base spill_temp1 v in
+          let (rv, lv) = resolve_src reg_map call_spill_base spill_temp1 v in
           Buffer.add_string buf lv;
           Buffer.add_string buf (Printf.sprintf "  sw %s, %d(sp)\n" rv ((i - 8) * 4));
           copy_excess (i + 1) rst
@@ -171,14 +172,14 @@ let emit_one buf spill_base reg_map = function
     List.iteri (fun i v ->
       if i < 8 then begin
         let areg = "a" ^ string_of_int i in
-        let (rv, lv) = resolve_src reg_map spill_base areg v in
+        let (rv, lv) = resolve_src reg_map call_spill_base areg v in
         Buffer.add_string buf lv;
         if rv <> areg then
           Buffer.add_string buf (Printf.sprintf "  mv %s, %s\n" areg rv)
       end
     ) args;
     Buffer.add_string buf (Printf.sprintf "  jal ra, %s\n" fname);
-    let (dst, st) = resolve_dst reg_map spill_base spill_temp1 rd in
+    let (dst, st) = resolve_dst reg_map call_spill_base spill_temp1 rd in
     Buffer.add_string buf (Printf.sprintf "  mv %s, a0\n" dst);
     Buffer.add_string buf st;
     if excess > 0 then

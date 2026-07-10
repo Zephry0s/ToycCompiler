@@ -74,7 +74,7 @@ let rec is_const_expr (st : scope_stack) (e : exp) : bool =
   | Num _ -> true
   | Id name ->
     (match lookup st name with
-     | Some (SymConst _) -> true
+     | Some (SymConst _) | Some SymVar -> true
      | _ -> false)
   | Binary (l, _, r) -> is_const_expr st l && is_const_expr st r
   | Unary (_, e) -> is_const_expr st e
@@ -192,7 +192,12 @@ and check_stmt_seq (st : scope_stack) (in_loop : bool) (ret_type : type_kind)
   List.fold_left (fun acc s -> check_stmt acc in_loop ret_type s) st stmts
 
 let check_top_decl (st : scope_stack) (d : decl) : scope_stack =
-  check_decl st d
+  match d with
+  | VarDecl (name, init) ->
+    if not (is_const_expr st init) then
+      failwith ("global variable '" ^ name ^ "' initializer must be compile-time constant");
+    check_decl st d
+  | _ -> check_decl st d
 
 let check_func_body (global_st : scope_stack) (f : func_def) : unit =
   let func_st = enter_scope global_st in
