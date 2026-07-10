@@ -10,3 +10,4 @@ _build/
 *.cmxs
 toyc
 result/output.s
+.vscode/

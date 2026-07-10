@@ -10,6 +10,7 @@ type ctx = {
   const_by_scope  : (int StringMap.t) list;
   scope_parent    : int list;
   mutable cur_scope : int;
+  mutable next_scope : int;
   ret_type        : type_kind;
 }
 
@@ -27,6 +28,20 @@ let var_lookup ctx name =
 
 let const_lookup ctx name =
   scope_find name ctx.cur_scope ctx.const_by_scope ctx.scope_parent
+
+type local_binding =
+  | LocalVar of int
+  | LocalConst of int
+
+let rec local_lookup ctx name scope_id =
+  if scope_id < 0 then None
+  else
+    match StringMap.find_opt name (List.nth ctx.var_by_scope scope_id) with
+    | Some off -> Some (LocalVar off)
+    | None ->
+      (match StringMap.find_opt name (List.nth ctx.const_by_scope scope_id) with
+       | Some value -> Some (LocalConst value)
+       | None -> local_lookup ctx name (List.nth ctx.scope_parent scope_id))
 
 let new_reg ctx =
   let r = ctx.next_reg in
@@ -59,19 +74,22 @@ let rec eval_const (global_syms : symbol StringMap.t)
            | _ -> failwith ("not a compile-time constant: " ^ name))))
   | Binary (l, op, r) ->
     let vl = eval_const global_syms local_consts global_vals l in
-    let vr = eval_const global_syms local_consts global_vals r in
     (match op with
-     | Add -> vl + vr  | Sub -> vl - vr  | Mul -> vl * vr
-     | Div -> if vr = 0 then failwith "division by zero" else vl / vr
-     | Mod -> if vr = 0 then failwith "division by zero" else vl mod vr
-     | And -> if vl <> 0 && vr <> 0 then 1 else 0
-     | Or  -> if vl <> 0 || vr <> 0 then 1 else 0
-     | Eq  -> if vl = vr  then 1 else 0
-     | Neq -> if vl <> vr then 1 else 0
-     | Lt  -> if vl < vr  then 1 else 0
-     | Gt  -> if vl > vr  then 1 else 0
-     | Le  -> if vl <= vr then 1 else 0
-     | Ge  -> if vl >= vr then 1 else 0)
+     | And -> if vl = 0 then 0 else if eval_const global_syms local_consts global_vals r <> 0 then 1 else 0
+     | Or  -> if vl <> 0 then 1 else if eval_const global_syms local_consts global_vals r <> 0 then 1 else 0
+     | _ ->
+       let vr = eval_const global_syms local_consts global_vals r in
+       match op with
+       | Add -> vl + vr  | Sub -> vl - vr  | Mul -> vl * vr
+       | Div -> if vr = 0 then failwith "division by zero" else vl / vr
+       | Mod -> if vr = 0 then failwith "division by zero" else vl mod vr
+       | Eq  -> if vl = vr  then 1 else 0
+       | Neq -> if vl <> vr then 1 else 0
+       | Lt  -> if vl < vr  then 1 else 0
+       | Gt  -> if vl > vr  then 1 else 0
+       | Le  -> if vl <= vr then 1 else 0
+       | Ge  -> if vl >= vr then 1 else 0
+       | And | Or -> assert false)
   | Unary (op, e) ->
     let v = eval_const global_syms local_consts global_vals e in
     (match op with Neg -> -v | Pos -> v | Not -> if v = 0 then 1 else 0)
@@ -99,6 +117,19 @@ let frame_info (global_syms : symbol StringMap.t) (params : param list)
   and add_const name v =
     add_entry const_maps name v
   in
+  let visible_consts () =
+    let rec scope_chain scope_id =
+      if scope_id < 0 then []
+      else scope_chain (List.nth !scope_parent scope_id) @ [scope_id]
+    in
+    List.fold_left (fun values scope_id ->
+      let values =
+        StringMap.fold (fun name _ acc -> StringMap.remove name acc)
+          (List.nth !var_maps scope_id) values
+      in
+      StringMap.fold StringMap.add (List.nth !const_maps scope_id) values
+    ) StringMap.empty (scope_chain !cur_scope)
+  in
   List.iter (fun p -> add_var p.p_name) params;
   let rec walk s = match s with
     | Block stmts ->
@@ -119,8 +150,7 @@ let frame_info (global_syms : symbol StringMap.t) (params : param list)
     | If (_, th, el) -> walk th; Option.iter walk el
     | While (_, body) -> walk body
     | Decl (ConstDecl (name, init)) ->
-      let cur_consts = List.nth !const_maps !cur_scope in
-      let v = eval_const global_syms cur_consts StringMap.empty init in
+      let v = eval_const global_syms (visible_consts ()) StringMap.empty init in
       add_const name v
     | Decl (VarDecl (name, _)) ->
       add_var name
@@ -142,30 +172,28 @@ let rec gen_expr (ctx : ctx) (e : exp) : vreg =
     emit ctx (Li (r, n));
     r
   | Id name ->
-    (match const_lookup ctx name with
-     | Some v ->
+    (match local_lookup ctx name ctx.cur_scope with
+     | Some (LocalConst v) ->
        let r = new_reg ctx in
        emit ctx (Li (r, v));
        r
+     | Some (LocalVar off) ->
+       let r = new_reg ctx in
+       emit ctx (Lw (r, sp, off));
+       r
      | None ->
-       (match var_lookup ctx name with
-        | Some off ->
+       (match StringMap.find_opt name ctx.symtab with
+        | Some (SymConst v) | Some (SymVarVal v) ->
           let r = new_reg ctx in
-          emit ctx (Lw (r, sp, off));
+          emit ctx (Li (r, v));
           r
-        | None ->
-           (match StringMap.find_opt name ctx.symtab with
-            | Some (SymConst v) | Some (SymVarVal v) ->
-              let r = new_reg ctx in
-              emit ctx (Li (r, v));
-              r
-            | Some SymVar ->
-              let addr_r = new_reg ctx in
-              let r = new_reg ctx in
-              emit ctx (La (addr_r, name));
-              emit ctx (Lw (r, addr_r, 0));
-              r
-           | _ -> failwith ("undefined variable '" ^ name ^ "'"))))
+        | Some SymVar ->
+          let addr_r = new_reg ctx in
+          let r = new_reg ctx in
+          emit ctx (La (addr_r, name));
+          emit ctx (Lw (r, addr_r, 0));
+          r
+        | _ -> failwith ("undefined variable '" ^ name ^ "'")))
   | Unary (op, e) ->
     let r = gen_expr ctx e in
     let rd = new_reg ctx in
@@ -223,18 +251,22 @@ let rec gen_stmt (ctx : ctx) (brk_lbl : string) (cnt_lbl : string)
     (s : stmt) : unit =
   match s with
   | Block stmts ->
-    ctx.cur_scope <- ctx.cur_scope + 1;
+    let parent_scope = ctx.cur_scope in
+    ctx.cur_scope <- ctx.next_scope;
+    ctx.next_scope <- ctx.next_scope + 1;
     List.iter (gen_stmt ctx brk_lbl cnt_lbl) stmts;
-    ctx.cur_scope <- List.nth ctx.scope_parent ctx.cur_scope
+    ctx.cur_scope <- parent_scope
   | Empty -> ()
   | Expr e ->
     ignore (gen_expr ctx e)
   | Assign (name, e) ->
     let r = gen_expr ctx e in
-    (match var_lookup ctx name with
-     | Some off ->
+    (match local_lookup ctx name ctx.cur_scope with
+     | Some (LocalVar off) ->
        emit ctx (Sw (sp, off, VReg r))
-      | None ->
+     | Some (LocalConst _) ->
+       failwith ("cannot assign to const '" ^ name ^ "'")
+     | None ->
         (match StringMap.find_opt name ctx.symtab with
          | Some SymVar | Some (SymVarVal _) ->
            let addr_r = new_reg ctx in
@@ -314,6 +346,7 @@ let gen_func (global_syms : symbol StringMap.t) (f : func_def) : func_ir =
     const_by_scope = const_maps;
     scope_parent;
     cur_scope = 0;
+    next_scope = 1;
     ret_type = f.ret_type;
   } in
   (match f.body with
