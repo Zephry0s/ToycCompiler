@@ -51,7 +51,7 @@ let rec eval_const (global_syms : symbol StringMap.t)
         | Some v -> v
         | None ->
           (match StringMap.find_opt name global_syms with
-           | Some (SymConst v) -> v
+           | Some (SymConst v) | Some (SymVarVal v) -> v
            | _ -> failwith ("not a compile-time constant: " ^ name))))
   | Binary (l, op, r) ->
     let vl = eval_const global_syms local_consts global_vals l in
@@ -143,17 +143,17 @@ let rec gen_expr (ctx : ctx) (e : exp) : vreg =
           emit ctx (Lw (r, sp, off));
           r
         | None ->
-          (match StringMap.find_opt name ctx.symtab with
-           | Some (SymConst v) ->
-             let r = new_reg ctx in
-             emit ctx (Li (r, v));
-             r
-           | Some SymVar ->
-             let addr_r = new_reg ctx in
-             let r = new_reg ctx in
-             emit ctx (La (addr_r, name));
-             emit ctx (Lw (r, addr_r, 0));
-             r
+           (match StringMap.find_opt name ctx.symtab with
+            | Some (SymConst v) | Some (SymVarVal v) ->
+              let r = new_reg ctx in
+              emit ctx (Li (r, v));
+              r
+            | Some SymVar ->
+              let addr_r = new_reg ctx in
+              let r = new_reg ctx in
+              emit ctx (La (addr_r, name));
+              emit ctx (Lw (r, addr_r, 0));
+              r
            | _ -> failwith ("undefined variable '" ^ name ^ "'"))))
   | Unary (op, e) ->
     let r = gen_expr ctx e in
@@ -223,13 +223,13 @@ let rec gen_stmt (ctx : ctx) (brk_lbl : string) (cnt_lbl : string)
     (match var_lookup ctx name with
      | Some off ->
        emit ctx (Sw (sp, off, VReg r))
-     | None ->
-       (match StringMap.find_opt name ctx.symtab with
-        | Some SymVar ->
-          let addr_r = new_reg ctx in
-          emit ctx (La (addr_r, name));
-          emit ctx (Sw (addr_r, 0, VReg r))
-        | _ -> failwith ("cannot assign to '" ^ name ^ "'")))
+      | None ->
+        (match StringMap.find_opt name ctx.symtab with
+         | Some SymVar | Some (SymVarVal _) ->
+           let addr_r = new_reg ctx in
+           emit ctx (La (addr_r, name));
+           emit ctx (Sw (addr_r, 0, VReg r))
+         | _ -> failwith ("cannot assign to '" ^ name ^ "'")))
   | If (cond, th, el) ->
     let r = gen_expr ctx cond in
     let else_l = new_label "if_else" in
@@ -330,16 +330,19 @@ let gen_module (global_syms : symbol StringMap.t) (cu : comp_unit) : module_ir =
   List.iter (fun top ->
     match top with
     | TopDecl (VarDecl (name, init)) ->
-      (match StringMap.find_opt name global_syms with
-       | Some (SymConst _) -> ()
-       | Some SymVar ->
-         let v =
-           try eval_const global_syms StringMap.empty !global_vals init
-           with Failure _ -> 0
-         in
-         global_vals := StringMap.add name v !global_vals;
-         globals := (name, v) :: !globals
-       | _ -> ())
+       (match StringMap.find_opt name global_syms with
+        | Some (SymConst _) -> ()
+        | Some (SymVarVal v) ->
+          global_vals := StringMap.add name v !global_vals;
+          globals := (name, v) :: !globals
+        | Some SymVar ->
+          let v =
+            try eval_const global_syms StringMap.empty !global_vals init
+            with Failure _ -> 0
+          in
+          global_vals := StringMap.add name v !global_vals;
+          globals := (name, v) :: !globals
+        | _ -> ())
     | TopDecl (ConstDecl _) -> ()
     | TopFunc f ->
       functions := gen_func global_syms f :: !functions
