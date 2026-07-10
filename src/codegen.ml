@@ -151,39 +151,7 @@ let emit_one buf spill_base reg_map = function
     let (dst, st) = resolve_dst reg_map spill_base spill_temp1 rd in
     Buffer.add_string buf (Printf.sprintf "  la %s, %s\n" dst name);
     Buffer.add_string buf st
-  | Call (rd, fname, args) ->
-    let n_args = List.length args in
-    let excess = if n_args > 8 then n_args - 8 else 0 in
-    let call_spill_base = spill_base + excess * 4 in
-    if excess > 0 then begin
-      Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" (-(excess * 4)));
-      let rec copy_excess i arg_list =
-        match arg_list with
-        | [] -> ()
-        | v :: rst when i >= 8 ->
-          let (rv, lv) = resolve_src reg_map call_spill_base spill_temp1 v in
-          Buffer.add_string buf lv;
-          Buffer.add_string buf (Printf.sprintf "  sw %s, %d(sp)\n" rv ((i - 8) * 4));
-          copy_excess (i + 1) rst
-        | _ :: rst -> copy_excess (i + 1) rst
-      in
-      copy_excess 0 args
-    end;
-    List.iteri (fun i v ->
-      if i < 8 then begin
-        let areg = "a" ^ string_of_int i in
-        let (rv, lv) = resolve_src reg_map call_spill_base areg v in
-        Buffer.add_string buf lv;
-        if rv <> areg then
-          Buffer.add_string buf (Printf.sprintf "  mv %s, %s\n" areg rv)
-      end
-    ) args;
-    Buffer.add_string buf (Printf.sprintf "  jal ra, %s\n" fname);
-    let (dst, st) = resolve_dst reg_map call_spill_base spill_temp1 rd in
-    Buffer.add_string buf (Printf.sprintf "  mv %s, a0\n" dst);
-    Buffer.add_string buf st;
-    if excess > 0 then
-      Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" (excess * 4))
+  | Call _ -> ()
   | Ret _ -> ()
   | Jmp label ->
     Buffer.add_string buf (Printf.sprintf "  j %s\n" label)
@@ -201,10 +169,12 @@ let emit_one buf spill_base reg_map = function
 let emit_func buf f (fa : func_alloc) =
   let stack_sz = f.fir_stack_sz in
   let spill_sz = fa.fa_spill_sz in
+  let caller_save_sz = fa.fa_caller_save_sz in
   let callee_count = List.length fa.fa_callee_used in
-  let total_frame = align16 (stack_sz + spill_sz + callee_count * 4 + 4) in
+  let total_frame = align16 (stack_sz + spill_sz + caller_save_sz + callee_count * 4 + 4) in
   let ra_off = total_frame - 4 in
   let spill_base = stack_sz in
+  let caller_save_base = stack_sz + spill_sz in
 
   let ret_label = "." ^ f.fir_name ^ "_ret" in
 
@@ -215,7 +185,7 @@ let emit_func buf f (fa : func_alloc) =
   Buffer.add_string buf (Printf.sprintf "  sw ra, %d(sp)\n" ra_off);
 
   List.iteri (fun i reg ->
-    let off = stack_sz + spill_sz + i * 4 in
+    let off = stack_sz + spill_sz + caller_save_sz + i * 4 in
     Buffer.add_string buf (Printf.sprintf "  sw %s, %d(sp)\n" reg off)
   ) fa.fa_callee_used;
 
@@ -242,7 +212,7 @@ let emit_func buf f (fa : func_alloc) =
     end
   done;
 
-  List.iter (function
+  List.iteri (fun idx -> function
     | Ret (Some v) ->
       let (rv, lv) = resolve_src fa.fa_reg_map spill_base "a0" v in
       Buffer.add_string buf lv;
@@ -251,6 +221,50 @@ let emit_func buf f (fa : func_alloc) =
       Buffer.add_string buf (Printf.sprintf "  j %s\n" ret_label)
     | Ret None ->
       Buffer.add_string buf (Printf.sprintf "  j %s\n" ret_label)
+    | Call (rd, fname, args) ->
+      let n_args = List.length args in
+      let excess = if n_args > 8 then n_args - 8 else 0 in
+      let call_spill_base = spill_base + excess * 4 in
+      let caller_regs = match Hashtbl.find_opt fa.fa_caller_saved_at_call idx with
+        | Some regs -> regs | None -> [] in
+      if excess > 0 then
+        Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" (-(excess * 4)));
+      List.iteri (fun i reg ->
+        Buffer.add_string buf (Printf.sprintf "  sw %s, %d(sp)\n" reg
+          (caller_save_base + excess * 4 + i * 4))
+      ) caller_regs;
+      if excess > 0 then begin
+        let rec copy_excess i arg_list =
+          match arg_list with
+          | [] -> ()
+          | v :: rst when i >= 8 ->
+            let (rv, lv) = resolve_src fa.fa_reg_map call_spill_base spill_temp1 v in
+            Buffer.add_string buf lv;
+            Buffer.add_string buf (Printf.sprintf "  sw %s, %d(sp)\n" rv ((i - 8) * 4));
+            copy_excess (i + 1) rst
+          | _ :: rst -> copy_excess (i + 1) rst
+        in
+        copy_excess 0 args
+      end;
+      List.iteri (fun i v ->
+        if i < 8 then begin
+          let areg = "a" ^ string_of_int i in
+          let (rv, lv) = resolve_src fa.fa_reg_map call_spill_base areg v in
+          Buffer.add_string buf lv;
+          if rv <> areg then
+            Buffer.add_string buf (Printf.sprintf "  mv %s, %s\n" areg rv)
+        end
+      ) args;
+      Buffer.add_string buf (Printf.sprintf "  jal ra, %s\n" fname);
+      let (dst, st) = resolve_dst fa.fa_reg_map call_spill_base spill_temp1 rd in
+      Buffer.add_string buf (Printf.sprintf "  mv %s, a0\n" dst);
+      Buffer.add_string buf st;
+      List.iteri (fun i reg ->
+        Buffer.add_string buf (Printf.sprintf "  lw %s, %d(sp)\n" reg
+          (caller_save_base + excess * 4 + i * 4))
+      ) caller_regs;
+      if excess > 0 then
+        Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" (excess * 4))
     | instr ->
       emit_one buf spill_base fa.fa_reg_map instr
   ) f.fir_body;
@@ -258,7 +272,7 @@ let emit_func buf f (fa : func_alloc) =
   Buffer.add_string buf (Printf.sprintf "%s:\n" ret_label);
   if f.fir_name = "main" then begin
     List.iteri (fun i reg ->
-      let off = stack_sz + spill_sz + i * 4 in
+      let off = stack_sz + spill_sz + caller_save_sz + i * 4 in
       Buffer.add_string buf (Printf.sprintf "  lw %s, %d(sp)\n" reg off)
     ) fa.fa_callee_used;
     Buffer.add_string buf (Printf.sprintf "  lw ra, %d(sp)\n" ra_off);
@@ -267,7 +281,7 @@ let emit_func buf f (fa : func_alloc) =
     Buffer.add_string buf "  ecall\n"
   end else begin
     List.iteri (fun i reg ->
-      let off = stack_sz + spill_sz + i * 4 in
+      let off = stack_sz + spill_sz + caller_save_sz + i * 4 in
       Buffer.add_string buf (Printf.sprintf "  lw %s, %d(sp)\n" reg off)
     ) fa.fa_callee_used;
     Buffer.add_string buf (Printf.sprintf "  lw ra, %d(sp)\n" ra_off);
