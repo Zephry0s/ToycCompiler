@@ -93,7 +93,7 @@ let frame_info (global_syms : symbol StringMap.t) (params : param list)
       if i = idx then StringMap.add name value m else m
     ) !maps_ref
   in
-  let rec add_var name =
+  let add_var name =
     add_entry var_maps name !next_off;
     next_off := !next_off + 4
   and add_const name v =
