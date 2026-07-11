@@ -1,6 +1,9 @@
 open Ast
 open Ir
 
+module SMap = Map.Make(String)
+module ISet = Set.Make(struct type t = int let compare = compare end)
+
 let max_iterations = 5
 
 (* --- Utility --- *)
@@ -334,6 +337,166 @@ let cse_func (f : func_ir) : func_ir =
 
 (* --- Iterative DCE wrapper using the local dead_code_elim pass --- *)
 
+(* ================================================================
+ * P0: Loop Detection
+ * ================================================================ *)
+
+type block_info = {
+  b_label : string option;
+  b_start : int;
+  b_end   : int;
+  mutable b_succs : int list;
+}
+
+let build_cfg (instrs : instr list) : (instr array * block_info array) =
+  let arr = Array.of_list instrs in
+  let n = Array.length arr in
+  let starts = Array.make n false in
+  if n > 0 then starts.(0) <- true;
+  for i = 0 to n - 1 do
+    match arr.(i) with
+    | Label _ -> starts.(i) <- true
+    | Jmp _ | Bz _ | Bnz _ | Ret _ ->
+      if i + 1 < n then starts.(i + 1) <- true
+    | _ -> ()
+  done;
+  let blocks = ref [] in
+  let label_map = ref SMap.empty in
+  let block_id = ref 0 in
+  let i = ref 0 in
+  while !i < n do
+    if starts.(!i) then begin
+      let start = !i in
+      let label = match arr.(start) with
+        | Label s -> Some s
+        | _ -> None
+      in
+      (match label with Some s -> label_map := SMap.add s !block_id !label_map | None -> ());
+      let j = ref (start + 1) in
+      while !j < n && not starts.(!j) do incr j done;
+      blocks := { b_label = label; b_start = start; b_end = !j - 1; b_succs = [] } :: !blocks;
+      incr block_id;
+      i := !j
+    end else
+      incr i
+  done;
+  let bb_arr = Array.of_list (List.rev !blocks) in
+  for bid = 0 to Array.length bb_arr - 1 do
+    let last = arr.(bb_arr.(bid).b_end) in
+    bb_arr.(bid).b_succs <- (match last with
+      | Jmp lbl -> (match SMap.find_opt lbl !label_map with Some id -> [id] | None -> [])
+      | Ret _ -> []
+      | Bz (_, lbl) | Bnz (_, lbl) ->
+        let tgt = match SMap.find_opt lbl !label_map with Some id -> [id] | None -> [] in
+        let fall = if bid + 1 < Array.length bb_arr then [bid + 1] else [] in
+        tgt @ fall
+      | _ -> if bid + 1 < Array.length bb_arr then [bid + 1] else [])
+  done;
+  (arr, bb_arr)
+
+type loop_info = {
+  l_header   : int;
+  l_bodies   : int list;
+  l_head_lbl : string;
+}
+
+let detect_loops (bb_arr : block_info array) : loop_info list =
+  let n = Array.length bb_arr in
+  let back_edges = ref [] in
+  for bid = 0 to n - 1 do
+    List.iter (fun succ ->
+      if succ <= bid then
+        back_edges := (bid, succ) :: !back_edges
+    ) bb_arr.(bid).b_succs
+  done;
+  let loops = ref [] in
+  List.iter (fun (tail, header) ->
+    let body = ref (ISet.singleton tail) in
+    let queue = Queue.create () in
+    Queue.add tail queue;
+    while not (Queue.is_empty queue) do
+      let b = Queue.take queue in
+      for pred = 0 to n - 1 do
+        if pred <> header && List.mem b bb_arr.(pred).b_succs
+           && not (ISet.mem pred !body) then begin
+          body := ISet.add pred !body;
+          Queue.add pred queue
+        end
+      done
+    done;
+    let body_list = ISet.elements !body in
+    let lbl = match bb_arr.(header).b_label with
+      | Some s -> s | None -> ".Lentry"
+    in
+    if List.length body_list > 0 then
+      loops := { l_header = header; l_bodies = body_list @ [header];
+                 l_head_lbl = lbl } :: !loops
+  ) !back_edges;
+  List.sort_uniq (fun a b -> compare a.l_header b.l_header) !loops
+
+(* ================================================================
+ * P1: Loop Invariant Code Motion (LICM)
+ * ================================================================ *)
+
+let licm_func (f : func_ir) : func_ir =
+  let arr, bbs = build_cfg f.fir_body in
+  let loops = detect_loops bbs in
+  if loops = [] then f
+  else begin
+    let invalidate = Array.make (Array.length arr) false in
+    let insertions = ref [] in
+    List.iter (fun lp ->
+      let header_inst = arr.(bbs.(lp.l_header).b_start) in
+      match header_inst with
+      | Label _ ->
+        let body_set = ref ISet.empty in
+        List.iter (fun b -> body_set := ISet.add b !body_set) lp.l_bodies;
+        let loop_defs = ref ISet.empty in
+        List.iter (fun b ->
+          for i = bbs.(b).b_start to bbs.(b).b_end do
+            match def_vreg arr.(i) with
+            | Some r -> loop_defs := ISet.add r !loop_defs
+            | None -> ()
+          done
+        ) lp.l_bodies;
+        let invariants = ref [] in
+        List.iter (fun b ->
+          for i = bbs.(b).b_start to bbs.(b).b_end do
+            match arr.(i) with
+            | Binop _ | Unop _ | Li _ | Mov _ ->
+              let srcs = src_vregs arr.(i) in
+              let all_external = List.for_all (fun r ->
+                not (ISet.mem r !loop_defs)
+              ) srcs in
+              if all_external then
+                (match def_vreg arr.(i) with
+                 | Some _ -> invariants := i :: !invariants
+                 | None -> ())
+            | _ -> ()
+          done
+        ) lp.l_bodies;
+        let invariants = List.sort_uniq compare !invariants in
+        if invariants <> [] then begin
+          let insert_pos = bbs.(lp.l_header).b_start + 1 in
+          List.iter (fun idx ->
+            invalidate.(idx) <- true;
+            insertions := (insert_pos, arr.(idx)) :: !insertions
+          ) (List.rev invariants)
+        end
+      | _ -> ()
+    ) loops;
+    let result = ref [] in
+    for i = 0 to Array.length arr - 1 do
+      if not invalidate.(i) then begin
+        result := arr.(i) :: !result;
+        List.iter (fun (pos, instr) ->
+          if pos = i then result := instr :: !result
+        ) !insertions
+      end
+    done;
+    { f with fir_body = List.rev !result }
+  end
+
 let dce (f : func_ir) : func_ir =
   let rec loop body =
     let body' = dead_code_elim body in
@@ -345,7 +508,8 @@ let dce (f : func_ir) : func_ir =
 
 let optimize_func (f : func_ir) : func_ir =
   let rec loop f =
-    let f1 = cse_func f in
+    let f_licm = licm_func f in
+    let f1 = cse_func f_licm in
     let f2 = { f1 with fir_body = optimize_func_body f1.fir_body } in
     let f3 = dce f2 in
     if List.length f3.fir_body = List.length f.fir_body then f3 else loop f3
