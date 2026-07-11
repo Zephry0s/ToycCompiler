@@ -392,6 +392,14 @@ let unroll_func (f : func_ir) : func_ir =
       let tstart = bbs.(tail).b_start in
       let tend = bbs.(tail).b_end in
 
+      let has_nested = ref false in
+      for j = hend + 1 to tend - 1 do
+        match arr.(j) with
+        | Bz _ | Bnz _ -> has_nested := true
+        | _ -> ()
+      done;
+      if !has_nested then () else begin
+
       let body_instrs = ref [] in
       for j = hstart to hend do body_instrs := arr.(j) :: !body_instrs done;
       for j = tstart to tend do body_instrs := arr.(j) :: !body_instrs done;
@@ -440,6 +448,7 @@ let unroll_func (f : func_ir) : func_ir =
           let copy = List.map (rename_instr !rmap) body_no_jmp in
           insert.(tend - 1) <- (List.rev copy) @ insert.(tend - 1)
         end
+      end
     ) !loops;
 
     let result = ref [] in
