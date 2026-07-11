@@ -157,15 +157,15 @@ and check_stmt (st : scope_stack) (in_loop : bool) (ret_type : type_kind)
      | None -> failwith ("undefined variable '" ^ name ^ "'"))
   | If (cond, th, el) ->
     ignore (check_cond st cond);
-    ignore (check_stmt st in_loop ret_type th);
-    (match el with
-     | Some el_s -> ignore (check_stmt st in_loop ret_type el_s)
-     | None -> ());
-    st
+    let st1 = check_stmt st in_loop ret_type th in
+    let st2 = match el with
+      | Some el_s -> check_stmt st1 in_loop ret_type el_s
+      | None -> st1
+    in
+    st2
   | While (cond, body) ->
     ignore (check_cond st cond);
-    ignore (check_stmt st true ret_type body);
-    st
+    check_stmt st true ret_type body
   | Break ->
     if not in_loop then failwith "break not in loop";
     st
