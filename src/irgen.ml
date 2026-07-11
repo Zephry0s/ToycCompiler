@@ -344,10 +344,11 @@ let gen_func (global_syms : symbol StringMap.t) (f : func_def) : func_ir =
   let all_vars = List.fold_left (fun acc m ->
     StringMap.fold (fun name off acc2 -> (name, off) :: acc2) m acc
   ) [] var_maps in
+  let param_end =
+    if f.params = [] then 0 else 4 + 4 * (List.length f.params - 1) in
   let local_list =
-    List.filter (fun (name, _) ->
-      not (List.exists (fun (pn, _) -> pn = name) param_list))
     all_vars
+    |> List.filter (fun (_, off) -> off > param_end)
     |> List.sort (fun (_, a) (_, b) -> compare a b)
   in
   List.iteri (fun i _ ->

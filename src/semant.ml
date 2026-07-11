@@ -24,8 +24,11 @@ let leave_scope (st : scope_stack) : scope_stack =
 
 let add_symbol (st : scope_stack) name sym : scope_stack =
   match st with
-  | [] -> [StringMap.add name sym StringMap.empty]
-  | cur :: rest -> StringMap.add name sym cur :: rest
+  | [] -> [StringMap.singleton name sym]
+  | cur :: rest ->
+    if StringMap.mem name cur then
+      failwith ("duplicate declaration '" ^ name ^ "' in the same scope");
+    StringMap.add name sym cur :: rest
 
 let rec lookup (st : scope_stack) name : symbol option =
   match st with
@@ -157,15 +160,15 @@ and check_stmt (st : scope_stack) (in_loop : bool) (ret_type : type_kind)
      | None -> failwith ("undefined variable '" ^ name ^ "'"))
   | If (cond, th, el) ->
     ignore (check_cond st cond);
-    let st1 = check_stmt st in_loop ret_type th in
-    let st2 = match el with
-      | Some el_s -> check_stmt st1 in_loop ret_type el_s
-      | None -> st1
-    in
-    st2
+    ignore (check_stmt st in_loop ret_type th);
+    (match el with
+     | Some el_s -> ignore (check_stmt st in_loop ret_type el_s)
+     | None -> ());
+    st
   | While (cond, body) ->
     ignore (check_cond st cond);
-    check_stmt st true ret_type body
+    ignore (check_stmt st true ret_type body);
+    st
   | Break ->
     if not in_loop then failwith "break not in loop";
     st
