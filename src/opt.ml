@@ -379,33 +379,75 @@ let unroll_func (f : func_ir) : func_ir =
       if succ <= bid then loops := (bid, succ) :: !loops
     ) bbs.(bid).b_succs
   done;
-  let loops = !loops in
-  if loops = [] then f
+  if !loops = [] then f
   else begin
     let max_vreg = find_max_vreg f.fir_body in
     let next_vreg = ref (max_vreg + 1) in
     let insert = Array.make (Array.length arr) [] in
+    let remove = Array.make (Array.length arr) false in
+
     List.iter (fun (tail, header) ->
       let hstart = bbs.(header).b_start in
+      let hend = bbs.(header).b_end in
+      let tstart = bbs.(tail).b_start in
       let tend = bbs.(tail).b_end in
-      let body = ref [] in
-      for j = hstart to tend do body := arr.(j) :: !body done;
-      let body = List.rev !body in
-      let body_no_label = List.filter (function Label _ -> false | _ -> true) body in
-      let body_defs = collect_defs body in
-      let rmap = ref IMap.empty in
-      ISet.iter (fun r ->
-        let fresh = !next_vreg in
-        incr next_vreg;
-        rmap := IMap.add r fresh !rmap
-      ) body_defs;
-      let copy = List.map (rename_instr !rmap) body_no_label in
-      insert.(tend - 1) <- (List.rev copy) @ insert.(tend - 1)
-    ) loops;
+
+      let body_instrs = ref [] in
+      for j = hstart to hend do body_instrs := arr.(j) :: !body_instrs done;
+      for j = tstart to tend do body_instrs := arr.(j) :: !body_instrs done;
+      let body_instrs = List.rev !body_instrs in
+
+      let body_defs = collect_defs body_instrs in
+
+      let trip_opt = ref None in
+      for j = hstart to hend do
+        match arr.(j) with
+        | Li (_, n) when n > 0 && n <= 4 ->
+          trip_opt := Some n
+        | _ -> ()
+      done;
+
+      match !trip_opt with
+      | Some k when k <= 2 ->
+        let tail_body = ref [] in
+        for j = tstart to tend do tail_body := arr.(j) :: !tail_body done;
+        let tail_body = List.rev !tail_body in
+        let body_only = List.filter (fun i ->
+          match i with Label _ | Bz _ | Bnz _ | Jmp _ -> false | _ -> true
+        ) tail_body in
+
+        let copies = ref [] in
+        for _ = 1 to k do
+          copies := (List.rev body_only) :: !copies
+        done;
+        for j = hstart to tend do remove.(j) <- true done;
+        if hstart > 0 then
+          insert.(hstart - 1) <- (List.flatten !copies |> List.rev) @ insert.(hstart - 1)
+
+      | _ ->
+        let body_tail = ref [] in
+        for j = tstart to tend do body_tail := arr.(j) :: !body_tail done;
+        let body_tail = List.rev !body_tail in
+        let body_no_jmp = List.filter (function Jmp _ -> false | _ -> true) body_tail in
+        let body_sz = List.length body_no_jmp in
+        if body_sz >= 5 then begin
+          let rmap = ref IMap.empty in
+          ISet.iter (fun r ->
+            let fresh = !next_vreg in
+            incr next_vreg;
+            rmap := IMap.add r fresh !rmap
+          ) body_defs;
+          let copy = List.map (rename_instr !rmap) body_no_jmp in
+          insert.(tend - 1) <- (List.rev copy) @ insert.(tend - 1)
+        end
+    ) !loops;
+
     let result = ref [] in
     for i = Array.length arr - 1 downto 0 do
-      List.iter (fun instr -> result := instr :: !result) insert.(i);
-      result := arr.(i) :: !result
+      if not remove.(i) then begin
+        List.iter (fun instr -> result := instr :: !result) insert.(i);
+        result := arr.(i) :: !result
+      end
     done;
     { f with fir_body = !result }
   end
