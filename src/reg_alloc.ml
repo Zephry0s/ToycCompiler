@@ -4,11 +4,26 @@ module ISet = Set.Make(struct type t = int let compare = compare end)
 module IMap = Map.Make(struct type t = int let compare = compare end)
 module SMap = Map.Make(String)
 
-let phys_regs = [|"t0"; "t1"; "t2"; "t3"; "t4";
-                  "s0"; "s1"; "s2"; "s3"; "s4"; "s5"; "s6"; "s7";
-                  "s8"; "s9"; "s10"; "s11"|]
+let default_phys_regs =
+  [|"t0"; "t1"; "t2"; "t3"; "t4";
+    "a0"; "a1"; "a2"; "a3"; "a4"; "a5"; "a6"; "a7";
+    "s0"; "s1"; "s2"; "s3"; "s4"; "s5"; "s6"; "s7";
+    "s8"; "s9"; "s10"; "s11"|]
 
-let num_regs = Array.length phys_regs
+(* A parameterless leaf has no ABI argument values to preserve and no call
+   that can clobber a-registers.  Treat a0-a7 as additional caller-saved
+   registers, as LLVM/GCC do after leaf-function analysis. *)
+let leaf_phys_regs =
+  [|"t0"; "t1"; "t2"; "t3"; "t4";
+    "a0"; "a1"; "a2"; "a3"; "a4"; "a5"; "a6"; "a7";
+    "s0"; "s1"; "s2"; "s3"; "s4"; "s5"; "s6"; "s7";
+    "s8"; "s9"; "s10"; "s11"|]
+
+(* [main] exits with an ecall and never consumes its incoming return address,
+   so [ra] is one more allocatable register when main itself is a leaf. *)
+let main_leaf_phys_regs =
+  Array.append leaf_phys_regs [|"ra"|]
+
 let spill_temp1 = "t5"
 let spill_temp2 = "t6"
 
@@ -241,7 +256,10 @@ let compute_intervals (instr_arr : instr array) (bb_arr : bb array)
 
 (* ---------- linear scan ---------- *)
 
-let linear_scan (first_def : int IMap.t) (last_use : int IMap.t) (call_positions : ISet.t) : func_alloc =
+let linear_scan (phys_regs : string array) (avoid_argument_regs : ISet.t)
+    (call_result_regs : ISet.t) (first_def : int IMap.t)
+    (last_use : int IMap.t) (call_positions : ISet.t) : func_alloc =
+  let num_regs = Array.length phys_regs in
   let intervals = ref [] in
   IMap.iter (fun vreg start ->
     let last = match IMap.find_opt vreg last_use with
@@ -266,7 +284,7 @@ let linear_scan (first_def : int IMap.t) (last_use : int IMap.t) (call_positions
   in
 
   let is_caller_saved r =
-    String.length r > 0 && r.[0] = 't'
+    String.length r > 0 && (r.[0] = 't' || r.[0] = 'a')
   in
 
   let reg_map = Hashtbl.create 64 in
@@ -275,20 +293,42 @@ let linear_scan (first_def : int IMap.t) (last_use : int IMap.t) (call_positions
   let active = Array.make num_regs (None : (int * int) option) in
   let next_spill = ref 0 in
 
-  let find_free ?(callee_only = false) () =
+  let is_argument_register r =
+    String.length r > 0 && r.[0] = 'a'
+  in
+
+  let find_free ?(callee_only = false) ?(avoid_a = false)
+      ?(prefer_a0 = false) () =
+    let preferred =
+      if prefer_a0 && not avoid_a && not callee_only then begin
+        let found = ref None in
+        for i = 0 to num_regs - 1 do
+          if phys_regs.(i) = "a0" && active.(i) = None then
+            found := Some i
+        done;
+        !found
+      end else None
+    in
     let rec loop i =
       if i >= num_regs then None
       else if active.(i) = None then
-        if callee_only && is_caller_saved phys_regs.(i) then loop (i + 1)
+        if (callee_only && is_caller_saved phys_regs.(i)) ||
+           (avoid_a && is_argument_register phys_regs.(i))
+        then loop (i + 1)
         else Some i
       else loop (i + 1)
-    in loop 0
+    in
+    match preferred with Some idx -> Some idx | None -> loop 0
   in
 
   let expire_active cur_start =
     for i = 0 to num_regs - 1 do
       match active.(i) with
-      | Some (_, e) when e < cur_start -> active.(i) <- None
+      (* A definition may reuse a source register whose final use is the same
+         instruction: RV32 reads both sources before writing [rd].  Modeling
+         intervals as half-open at that boundary is the small linear-scan
+         equivalent of LLVM's early-clobber-aware live-range coalescing. *)
+      | Some (_, e) when e <= cur_start -> active.(i) <- None
       | _ -> ()
     done
   in
@@ -297,8 +337,10 @@ let linear_scan (first_def : int IMap.t) (last_use : int IMap.t) (call_positions
     expire_active iv.i_start;
 
     let need_callee = spans_call iv in
+    let avoid_a = ISet.mem iv.i_vreg avoid_argument_regs in
+    let prefer_a0 = ISet.mem iv.i_vreg call_result_regs in
     let idx =
-      find_free ~callee_only:need_callee ()
+      find_free ~callee_only:need_callee ~avoid_a ~prefer_a0 ()
     in
 
     (match idx with
@@ -313,7 +355,8 @@ let linear_scan (first_def : int IMap.t) (last_use : int IMap.t) (call_positions
       let max_end = ref (-1) in
       for i = 0 to num_regs - 1 do
         let eligible =
-          not need_callee || is_callee_saved phys_regs.(i)
+          (not need_callee || is_callee_saved phys_regs.(i)) &&
+          (not avoid_a || not (is_argument_register phys_regs.(i)))
         in
         match eligible, active.(i) with
         | true, Some (_, e) when e > !max_end ->
@@ -353,9 +396,287 @@ let linear_scan (first_def : int IMap.t) (last_use : int IMap.t) (call_positions
     fa_callee_used = !callee_used;
     fa_spill_sz    = !next_spill }
 
+(* ---------- interference-graph coloring ---------- *)
+
+let graph_color (phys_regs : string array) (avoid_argument_regs : ISet.t)
+    (call_result_regs : ISet.t) (parameter_count : int)
+    (instr_arr : instr array)
+    (bb_arr : bb array) (live_in : ISet.t array)
+    (live_out : ISet.t array) : func_alloc =
+  let num_regs = Array.length phys_regs in
+  let adjacency = Hashtbl.create 128 in
+  let move_partners = Hashtbl.create 64 in
+  let weights = Hashtbl.create 128 in
+  let across_calls = ref ISet.empty in
+  let nodes = ref ISet.empty in
+
+  let ensure_node reg =
+    if reg <> 0 then begin
+      nodes := ISet.add reg !nodes;
+      if not (Hashtbl.mem adjacency reg) then
+        Hashtbl.add adjacency reg ISet.empty
+    end
+  in
+  let add_edge left right =
+    if left <> 0 && right <> 0 && left <> right then begin
+      ensure_node left;
+      ensure_node right;
+      Hashtbl.replace adjacency left
+        (ISet.add right (Hashtbl.find adjacency left));
+      Hashtbl.replace adjacency right
+        (ISet.add left (Hashtbl.find adjacency right))
+    end
+  in
+  let add_move left right =
+    if left <> 0 && right <> 0 && left <> right then begin
+      let add_one from_reg to_reg =
+        let old =
+          match Hashtbl.find_opt move_partners from_reg with
+          | Some set -> set
+          | None -> ISet.empty
+        in
+        Hashtbl.replace move_partners from_reg (ISet.add to_reg old)
+      in
+      add_one left right;
+      add_one right left
+    end
+  in
+  (* Incoming parameters have no defining IR instruction.  Add their
+     entry-live clique explicitly; otherwise two simultaneously live
+     arguments could be assigned the same physical register. *)
+  if Array.length live_in > 0 then
+    ISet.iter (fun left ->
+      ISet.iter (fun right -> add_edge left right) live_in.(0)
+    ) live_in.(0);
+  let backedges =
+    Array.fold_left (fun edges block ->
+      List.fold_left (fun edges successor ->
+        if successor <= block.bb_id then (successor, block.bb_id) :: edges
+        else edges
+      ) edges block.bb_succs
+    ) [] bb_arr
+  in
+  let block_weight block_id =
+    let depth =
+      List.fold_left (fun depth (header, latch) ->
+        if block_id >= header && block_id <= latch then depth + 1 else depth
+      ) 0 backedges
+    in
+    if depth <= 0 then 1
+    else if depth = 1 then 10
+    else if depth = 2 then 100
+    else 1000
+  in
+  let add_weight reg amount =
+    if reg <> 0 then begin
+      ensure_node reg;
+      let old =
+        match Hashtbl.find_opt weights reg with Some value -> value | None -> 0
+      in
+      Hashtbl.replace weights reg (old + amount)
+    end
+  in
+
+  Array.iter (fun block ->
+    let weight = block_weight block.bb_id in
+    let live = ref live_out.(block.bb_id) in
+    ISet.iter ensure_node !live;
+    for idx = block.bb_end downto block.bb_start do
+      let instr = instr_arr.(idx) in
+      let uses = use_set instr in
+      ISet.iter (fun reg -> add_weight reg weight) uses;
+      (match def_opt instr with
+       | Some rd ->
+         add_weight rd weight;
+         ISet.iter (fun live_reg -> add_edge rd live_reg) !live;
+         (match instr with
+          | Mov (_, VReg source) -> add_move rd source
+          | _ -> ())
+       | None -> ());
+      (match instr with
+       | Call (rd, _, _) ->
+         across_calls := ISet.union !across_calls (ISet.remove rd !live)
+       | _ -> ());
+      live :=
+        ISet.union uses
+          (match def_opt instr with
+           | Some rd -> ISet.remove rd !live
+           | None -> !live)
+    done
+  ) bb_arr;
+
+  let is_argument_register reg =
+    String.length reg > 0 && reg.[0] = 'a'
+  in
+  let allowed_colors vreg =
+    let needs_callee = ISet.mem vreg !across_calls in
+    let avoids_a = ISet.mem vreg avoid_argument_regs in
+    let colors = ref [] in
+    for color = num_regs - 1 downto 0 do
+      let reg = phys_regs.(color) in
+      if (not needs_callee || is_callee_saved reg) &&
+         (not avoids_a || not (is_argument_register reg))
+      then colors := color :: !colors
+    done;
+    !colors
+  in
+  let colors = Hashtbl.create 128 in
+  (* Keep non-call-crossing incoming arguments in their ABI registers.  This
+     is equivalent to precoloring LLVM's physical-register copies and removes
+     both entry moves and needless callee-saved saves. *)
+  for parameter = 1 to min 8 parameter_count do
+    if not (ISet.mem parameter !across_calls) &&
+       not (ISet.mem parameter avoid_argument_regs) then
+      for color = 0 to num_regs - 1 do
+        if phys_regs.(color) = "a" ^ string_of_int (parameter - 1) then
+          Hashtbl.replace colors parameter color
+      done
+  done;
+  let remaining = ref !nodes in
+  let stack = ref [] in
+  let remaining_degree reg =
+    match Hashtbl.find_opt adjacency reg with
+    | None -> 0
+    | Some neighbors ->
+      ISet.cardinal (ISet.inter neighbors !remaining)
+  in
+  while not (ISet.is_empty !remaining) do
+    let low_degree =
+      ISet.fold (fun reg choice ->
+        let degree = remaining_degree reg in
+        if degree < List.length (allowed_colors reg) then
+          match choice with
+          | None -> Some reg
+          | Some old when degree > remaining_degree old -> Some reg
+          | Some _ -> choice
+        else choice
+      ) !remaining None
+    in
+    let chosen =
+      match low_degree with
+      | Some reg -> reg
+      | None ->
+        (* Potential spill: evict the coldest value per interference edge.
+           Loop-depth weighting keeps induction and reduction values in
+           registers ahead of one-shot setup temporaries. *)
+        ISet.fold (fun reg best ->
+          let weight =
+            match Hashtbl.find_opt weights reg with Some value -> value | None -> 1
+          in
+          let degree = max 1 (remaining_degree reg) in
+          match best with
+          | None -> Some (reg, weight, degree)
+          | Some (_, best_weight, best_degree) as old ->
+            if weight * best_degree < best_weight * degree then
+              Some (reg, weight, degree)
+            else old
+        ) !remaining None
+        |> Option.get
+        |> fun (reg, _, _) -> reg
+    in
+    remaining := ISet.remove chosen !remaining;
+    stack := chosen :: !stack
+  done;
+
+  let reg_map = Hashtbl.create 128 in
+  let callee_used = ref [] in
+  let next_spill = ref 0 in
+  let color_available used color = not (ISet.mem color used) in
+  List.iter (fun reg ->
+    let used_colors =
+      match Hashtbl.find_opt adjacency reg with
+      | None -> ISet.empty
+      | Some neighbors ->
+        ISet.fold (fun neighbor used ->
+          match Hashtbl.find_opt colors neighbor with
+          | Some color -> ISet.add color used
+          | None -> used
+        ) neighbors ISet.empty
+    in
+    let allowed = allowed_colors reg in
+    let move_preference =
+      match Hashtbl.find_opt move_partners reg with
+      | None -> None
+      | Some partners ->
+        ISet.fold (fun partner choice ->
+          match choice, Hashtbl.find_opt colors partner with
+          | Some _, _ -> choice
+          | None, Some color
+            when List.mem color allowed && color_available used_colors color ->
+            Some color
+          | None, _ -> None
+        ) partners None
+    in
+    let a0_preference =
+      if ISet.mem reg call_result_regs then begin
+        let found = ref None in
+        List.iter (fun color ->
+          if phys_regs.(color) = "a0" &&
+             color_available used_colors color then found := Some color
+        ) allowed;
+        !found
+      end else None
+    in
+    let chosen_color =
+      match Hashtbl.find_opt colors reg with
+      | Some color -> Some color
+      | None ->
+        (match move_preference, a0_preference with
+         | Some color, _ -> Some color
+         | None, Some color -> Some color
+         | None, None ->
+           List.find_opt (color_available used_colors) allowed)
+    in
+    match chosen_color with
+    | Some color ->
+      Hashtbl.replace colors reg color;
+      let physical = phys_regs.(color) in
+      Hashtbl.replace reg_map reg (Reg physical);
+      if is_callee_saved physical &&
+         not (List.mem physical !callee_used) then
+        callee_used := physical :: !callee_used
+    | None ->
+      Hashtbl.replace reg_map reg (Spill !next_spill);
+      next_spill := !next_spill + 4
+  ) !stack;
+  { fa_reg_map = reg_map;
+    fa_callee_used = !callee_used;
+    fa_spill_sz = !next_spill }
+
 let alloc_func (f : func_ir) : func_alloc =
   let instr_arr, bb_arr = build_blocks f.fir_body in
   let use_arr, def_arr = compute_use_def instr_arr bb_arr in
   let live_in, live_out = compute_liveness bb_arr use_arr def_arr in
   let first_def, last_use, call_positions = compute_intervals instr_arr bb_arr live_in live_out in
-  linear_scan first_def last_use call_positions
+  (* Values used as call arguments stay out of a0-a7.  This lets codegen keep
+     its simple left-to-right argument setup without a parallel-copy cycle,
+     while every other non-cross-call interval can still use the expanded
+     caller-saved register bank.  Incoming parameter vregs are excluded for
+     the same reason. *)
+  let avoid_argument_regs =
+    Array.fold_left (fun set -> function
+      | Call (_, _, args) ->
+        List.fold_left (fun set -> function
+          | VReg reg when reg <> 0 -> ISet.add reg set
+          | VReg _ | VImm _ -> set
+        ) set args
+      | _ -> set
+    ) ISet.empty instr_arr
+  in
+  let call_result_regs =
+    Array.fold_left (fun set -> function
+      | Call (rd, _, _) when rd <> 0 -> ISet.add rd set
+      | _ -> set
+    ) ISet.empty instr_arr
+  in
+  let phys_regs =
+    if ISet.is_empty call_positions && f.fir_params = [] &&
+       f.fir_name = "main" then main_leaf_phys_regs
+    else if ISet.is_empty call_positions && f.fir_params = [] then
+      leaf_phys_regs
+    else default_phys_regs
+  in
+  ignore first_def;
+  ignore last_use;
+  graph_color phys_regs avoid_argument_regs call_result_regs
+    (List.length f.fir_params) instr_arr bb_arr live_in live_out

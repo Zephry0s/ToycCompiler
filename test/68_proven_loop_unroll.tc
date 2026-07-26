@@ -1,0 +1,9 @@
+int main() {
+  int i = 0;
+  int sum = 0;
+  while (i < 1000) {
+    sum = sum + i % 17;
+    i = i + 1;
+  }
+  return sum;
+}
