@@ -2,6 +2,8 @@ open Ast
 open Ir
 open Semant
 
+module StringSet = Set.Make (String)
+
 type ctx = {
   mutable next_reg : int;
   mutable instrs  : instr list;
@@ -9,26 +11,13 @@ type ctx = {
   var_by_scope    : (int StringMap.t) list;
   const_by_scope  : (int StringMap.t) list;
   scope_parent    : int list;
+  active_by_scope : StringSet.t array;
   mutable cur_scope : int;
   mutable next_scope : int;
-  mutable hidden_local : (int * string) option;
   ret_type        : type_kind;
 }
 
 let sp = 0
-
-let rec scope_find name scope_id maps scope_parent =
-  if scope_id < 0 then None
-  else
-    match StringMap.find_opt name (List.nth maps scope_id) with
-    | Some _ as v -> v
-    | None -> scope_find name (List.nth scope_parent scope_id) maps scope_parent
-
-let var_lookup ctx name =
-  scope_find name ctx.cur_scope ctx.var_by_scope ctx.scope_parent
-
-let const_lookup ctx name =
-  scope_find name ctx.cur_scope ctx.const_by_scope ctx.scope_parent
 
 type local_binding =
   | LocalVar of int
@@ -36,7 +25,7 @@ type local_binding =
 
 let rec local_lookup ctx name scope_id =
   if scope_id < 0 then None
-  else if ctx.hidden_local = Some (scope_id, name) then
+  else if not (StringSet.mem name ctx.active_by_scope.(scope_id)) then
     local_lookup ctx name (List.nth ctx.scope_parent scope_id)
   else
     match StringMap.find_opt name (List.nth ctx.var_by_scope scope_id) with
@@ -45,6 +34,14 @@ let rec local_lookup ctx name scope_id =
       (match StringMap.find_opt name (List.nth ctx.const_by_scope scope_id) with
        | Some value -> Some (LocalConst value)
        | None -> local_lookup ctx name (List.nth ctx.scope_parent scope_id))
+
+let activate_local ctx name =
+  let scope_id = ctx.cur_scope in
+  ctx.active_by_scope.(scope_id) <-
+    StringSet.add name ctx.active_by_scope.(scope_id)
+
+let current_var_offset ctx name =
+  StringMap.find_opt name (List.nth ctx.var_by_scope ctx.cur_scope)
 
 let new_reg ctx =
   let r = ctx.next_reg in
@@ -120,6 +117,16 @@ let frame_info (global_syms : symbol StringMap.t) (params : param list)
   and add_const name v =
     add_entry const_maps name v
   in
+  let with_new_scope f =
+    let parent = !cur_scope in
+    let child = List.length !var_maps in
+    var_maps := !var_maps @ [StringMap.empty];
+    const_maps := !const_maps @ [StringMap.empty];
+    scope_parent := !scope_parent @ [parent];
+    cur_scope := child;
+    f ();
+    cur_scope := parent
+  in
   let visible_consts () =
     let rec scope_chain scope_id =
       if scope_id < 0 then []
@@ -136,34 +143,24 @@ let frame_info (global_syms : symbol StringMap.t) (params : param list)
   List.iter (fun p -> add_var p.p_name) params;
   let rec walk s = match s with
     | Block stmts ->
-      let parent = !cur_scope in
-      cur_scope := List.length !var_maps;
-      while List.length !scope_parent <= !cur_scope do
-        scope_parent := !scope_parent @ [(-1)]
-      done;
-      scope_parent := List.mapi (fun i p ->
-        if i = !cur_scope then parent else p
-      ) !scope_parent;
-      while List.length !var_maps <= !cur_scope do
-        var_maps := !var_maps @ [StringMap.empty];
-        const_maps := !const_maps @ [StringMap.empty]
-      done;
-      List.iter walk stmts;
-      cur_scope := parent
-    | If (_, th, el) -> walk th; Option.iter walk el
-    | While (_, body) -> walk body
+      with_new_scope (fun () -> List.iter walk stmts)
+    | If (_, th, el) ->
+      walk_control_stmt th;
+      Option.iter walk_control_stmt el
+    | While (_, body) ->
+      walk_control_stmt body
     | Decl (ConstDecl (name, init)) ->
       let v = eval_const global_syms (visible_consts ()) StringMap.empty init in
       add_const name v
     | Decl (VarDecl (name, _)) ->
       add_var name
     | _ -> ()
+  and walk_control_stmt s =
+    match s with
+    | Block _ -> walk s
+    | _ -> with_new_scope (fun () -> walk s)
   in
-  let body_stmts = match body with
-    | Block stmts -> stmts
-    | _ -> [body]
-  in
-  List.iter walk body_stmts;
+  walk body;
   let total = !next_off in
   let aligned = (total + 15) / 16 * 16 in
   (!var_maps, !const_maps, !scope_parent, aligned)
@@ -250,15 +247,23 @@ and gen_lor ctx l r =
   emit ctx (Label end_l);
   rd
 
+let with_codegen_scope ctx f =
+  let parent_scope = ctx.cur_scope in
+  ctx.cur_scope <- ctx.next_scope;
+  ctx.next_scope <- ctx.next_scope + 1;
+  try
+    f ();
+    ctx.cur_scope <- parent_scope
+  with exn ->
+    ctx.cur_scope <- parent_scope;
+    raise exn
+
 let rec gen_stmt (ctx : ctx) (brk_lbl : string) (cnt_lbl : string)
     (s : stmt) : unit =
   match s with
   | Block stmts ->
-    let parent_scope = ctx.cur_scope in
-    ctx.cur_scope <- ctx.next_scope;
-    ctx.next_scope <- ctx.next_scope + 1;
-    List.iter (gen_stmt ctx brk_lbl cnt_lbl) stmts;
-    ctx.cur_scope <- parent_scope
+    with_codegen_scope ctx (fun () ->
+      List.iter (gen_stmt ctx brk_lbl cnt_lbl) stmts)
   | Empty -> ()
   | Expr e ->
     ignore (gen_expr ctx e)
@@ -281,12 +286,12 @@ let rec gen_stmt (ctx : ctx) (brk_lbl : string) (cnt_lbl : string)
     let else_l = new_label "if_else" in
     let end_l = new_label "if_end" in
     emit ctx (Bz (VReg r, else_l));
-    gen_stmt ctx brk_lbl cnt_lbl th;
+    gen_control_stmt ctx brk_lbl cnt_lbl th;
     (match el with
      | Some el_s ->
        emit ctx (Jmp end_l);
        emit ctx (Label else_l);
-       gen_stmt ctx brk_lbl cnt_lbl el_s
+       gen_control_stmt ctx brk_lbl cnt_lbl el_s
      | None ->
        emit ctx (Label else_l));
     emit ctx (Label end_l)
@@ -296,7 +301,7 @@ let rec gen_stmt (ctx : ctx) (brk_lbl : string) (cnt_lbl : string)
     emit ctx (Label begin_l);
     let r = gen_expr ctx cond in
     emit ctx (Bz (VReg r, end_l));
-    gen_stmt ctx end_l begin_l body;
+    gen_control_stmt ctx end_l begin_l body;
     emit ctx (Jmp begin_l);
     emit ctx (Label end_l)
   | Break ->
@@ -310,28 +315,26 @@ let rec gen_stmt (ctx : ctx) (brk_lbl : string) (cnt_lbl : string)
        emit ctx (Ret (Some (VReg r)))
      | None ->
        emit ctx (Ret None))
-  | Decl (ConstDecl (_, _)) ->
-    ()
+  | Decl (ConstDecl (name, _)) ->
+    activate_local ctx name
   | Decl (VarDecl (name, init)) ->
-    (* A declaration is not visible inside its own initializer.  This matters
-       for `int x = x + 1` in a scope that shadows an outer x. *)
-    let old_hidden = ctx.hidden_local in
-    ctx.hidden_local <- Some (ctx.cur_scope, name);
-    let r =
-      try
-        let value = gen_expr ctx init in
-        ctx.hidden_local <- old_hidden;
-        value
-      with exn ->
-        ctx.hidden_local <- old_hidden;
-        raise exn
-    in
+    (* The new binding is activated after its initializer, so an initializer
+       can still refer to an outer declaration with the same name. *)
+    let r = gen_expr ctx init in
     let off =
-      match var_lookup ctx name with
+      match current_var_offset ctx name with
       | Some o -> o
       | None -> failwith ("no offset for local var '" ^ name ^ "'")
     in
+    activate_local ctx name;
     emit ctx (Sw (sp, off, VReg r))
+
+and gen_control_stmt ctx brk_lbl cnt_lbl s =
+  match s with
+  | Block _ -> gen_stmt ctx brk_lbl cnt_lbl s
+  | _ ->
+    with_codegen_scope ctx (fun () ->
+      gen_stmt ctx brk_lbl cnt_lbl s)
 
 let gen_func (global_syms : symbol StringMap.t) (f : func_def) : func_ir =
   let var_maps, const_maps, scope_parent, stack_sz =
@@ -354,6 +357,13 @@ let gen_func (global_syms : symbol StringMap.t) (f : func_def) : func_ir =
   List.iteri (fun i _ ->
     instrs := Sw (sp, 4 + 4 * i, VReg (1 + i)) :: !instrs
   ) f.params;
+  let active_by_scope =
+    Array.make (List.length var_maps) StringSet.empty
+  in
+  active_by_scope.(0) <-
+    List.fold_left (fun active p ->
+      StringSet.add p.p_name active
+    ) StringSet.empty f.params;
   let ctx = {
     next_reg = !next_reg;
     instrs  = !instrs;
@@ -361,13 +371,13 @@ let gen_func (global_syms : symbol StringMap.t) (f : func_def) : func_ir =
     var_by_scope = var_maps;
     const_by_scope = const_maps;
     scope_parent;
+    active_by_scope;
     cur_scope = 0;
     next_scope = 1;
-    hidden_local = None;
     ret_type = f.ret_type;
   } in
   (match f.body with
-   | Block stmts -> List.iter (gen_stmt ctx ".ret" ".ret") stmts
+   | Block _ -> gen_stmt ctx ".ret" ".ret" f.body
    | _ -> failwith "function body must be a block");
   (match ctx.instrs with
    | (Ret _) :: _ -> ()
