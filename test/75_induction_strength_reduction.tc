@@ -1,0 +1,19 @@
+int recurrence(int count, int seed) {
+  int i = 0;
+  int a = seed;
+  int b = seed + 1;
+  int c = seed + 2;
+  int d = seed + 3;
+  while (i < count) {
+    a = a + i * 3 + 5;
+    b = b + i * 5 + 7;
+    c = c + i * 7 + 9;
+    d = d + i * 9 + 11;
+    i = i + 1;
+  }
+  return a + b + c + d;
+}
+
+int main() {
+  return recurrence(257, 3) % 97;
+}
