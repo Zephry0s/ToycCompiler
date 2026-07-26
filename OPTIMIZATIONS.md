@@ -115,6 +115,11 @@ IR 中对应的 `Call func` 紧跟 `Ret`。优化器将其改写为：
 
 只在调用处作为实参使用、或由调用产生的结果，不属于“跨越调用”的值，可以继续使用 `t0`–`t4`。
 
+调用点集合使用区间存在性检查来判断是否有调用严格落在
+`(interval_start, interval_end)` 内。这里不能使用带“双边界”谓词的
+`Set.find_first`：该接口要求谓词单调，而多调用点下的区间谓词并不单调，
+会漏判较早的调用，使仍然活跃的值错误留在 `t` 寄存器中。
+
 基于这一约束，调用代码不再固定保存和恢复全部 5 个临时寄存器。超过 8 个的实参仍通过对齐后的调用栈区域传递。
 
 实现位置：
@@ -157,6 +162,7 @@ IR 中对应的 `Call func` 紧跟 `Ret`。优化器将其改写为：
 - `57_loop_call_cache.tc`：缓存值跨越函数调用；
 - `58_nested_loop_cache.tc`：嵌套循环；
 - `59_tail_recursion_inside_loop.tc`：循环内尾递归控制流；
-- `60_dead_store_side_effect.tc`：删除死存储但保留函数调用副作用。
+- `60_dead_store_side_effect.tc`：删除死存储但保留函数调用副作用；
+- `61_many_variables_call_pressure.tc`：大量局部变量在多调用点之间保持正确值，覆盖调用点区间判断和 caller-save 压力。
 
 测试时同时执行普通模式与 `-opt` 模式，并与 GCC 结果对照；生成的 RV32IM 汇编使用交叉汇编器检查，并在 QEMU RISC-V32 中执行。

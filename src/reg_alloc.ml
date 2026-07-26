@@ -254,14 +254,14 @@ let linear_scan (first_def : int IMap.t) (last_use : int IMap.t) (call_positions
   let intervals = List.sort (fun a b -> compare a.i_start b.i_start) !intervals in
 
   let spans_call iv =
+    (* [Set.find_first] requires a monotone predicate.  Testing both interval
+       bounds with it is not monotone and can miss an earlier call when a
+       function contains many call sites. *)
     try
-      (* A value used only as an argument at the call, or defined by the call,
-         does not have to survive it. *)
-      let _ = ISet.find_first
-        (fun pos -> pos > iv.i_start && pos < iv.i_end)
-        call_positions
+      let next_call =
+        ISet.find_first (fun pos -> pos > iv.i_start) call_positions
       in
-      true
+      next_call < iv.i_end
     with Not_found -> false
   in
 
