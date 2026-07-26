@@ -362,6 +362,142 @@ let global_const_prop (f : func_ir) : func_ir =
     { f with fir_body = Array.to_list rewritten }
   end
 
+(* CFG-wide copy propagation.  This is deliberately separate from constant
+   propagation: CSE and slot promotion create register-to-register copies
+   whose values remain useful across block boundaries even when they are not
+   constants.  Meet keeps only facts that are identical on every incoming
+   path, matching LLVM's conservative value propagation at joins. *)
+let global_copy_prop (f : func_ir) : func_ir =
+  let cfg = build_cfg f.fir_body in
+  let block_count = Array.length cfg.cfg_blocks in
+  if block_count = 0 then f
+  else
+    let rec resolve depth state = function
+      | VImm _ as value -> value
+      | VReg 0 as value -> value
+      | VReg reg as value ->
+        if depth >= 16 then value
+        else
+          match IntMap.find_opt reg state with
+          | Some replacement -> resolve (depth + 1) state replacement
+          | None -> value
+    in
+    let kill state reg =
+      IntMap.filter (fun key value ->
+        key <> reg &&
+        match resolve 0 state value with
+        | VReg source -> source <> reg
+        | VImm _ -> true
+      ) state
+    in
+    let rewrite state instr =
+      let value = resolve 0 state in
+      let base reg =
+        match value (VReg reg) with VReg mapped -> mapped | VImm _ -> reg
+      in
+      match instr with
+      | Binop (rd, op, left, right) ->
+        Binop (rd, op, value left, value right)
+      | Unop (rd, op, operand) ->
+        Unop (rd, op, value operand)
+      | Mov (rd, operand) -> Mov (rd, value operand)
+      | Lw (rd, address, offset) -> Lw (rd, base address, offset)
+      | Sw (address, offset, operand) ->
+        Sw (base address, offset, value operand)
+      | Call (rd, name, args) ->
+        Call (rd, name, List.map value args)
+      | Ret (Some operand) -> Ret (Some (value operand))
+      | Bz (operand, label) -> Bz (value operand, label)
+      | Bnz (operand, label) -> Bnz (value operand, label)
+      | Li _ | La _ | Ret None | Jmp _ | Label _ -> instr
+    in
+    let transfer state instr =
+      match def_vreg instr with
+      | None -> state
+      | Some rd ->
+        let state = kill state rd in
+        (match instr with
+         | Mov (_, operand) ->
+           let operand = resolve 0 state operand in
+           (match operand with
+            | VReg source when source = rd -> state
+            | _ -> IntMap.add rd operand state)
+         | Li (_, constant) ->
+           IntMap.add rd (VImm (normalize_i32 constant)) state
+         | _ -> state)
+    in
+    let meet states =
+      match states with
+      | [] -> IntMap.empty
+      | first :: rest ->
+        List.fold_left (fun common incoming ->
+          IntMap.merge (fun _ left right ->
+            match left, right with
+            | Some a, Some b when a = b -> Some a
+            | _ -> None
+          ) common incoming
+        ) first rest
+    in
+    let reachable = reachable_blocks cfg in
+    let in_states = Array.make block_count None in
+    let out_states = Array.make block_count None in
+    let option_equal left right =
+      match left, right with
+      | None, None -> true
+      | Some lhs, Some rhs -> IntMap.equal ( = ) lhs rhs
+      | _ -> false
+    in
+    let changed = ref true in
+    while !changed do
+      changed := false;
+      for block_id = 0 to block_count - 1 do
+        if reachable.(block_id) then begin
+          let block = cfg.cfg_blocks.(block_id) in
+          let predecessor_states =
+            List.filter_map (fun predecessor -> out_states.(predecessor))
+              block.cb_preds
+          in
+          let incoming =
+            if block_id = 0 then Some IntMap.empty
+            else
+              match predecessor_states with
+              | [] -> None
+              | states -> Some (meet states)
+          in
+          let outgoing =
+            match incoming with
+            | None -> None
+            | Some initial ->
+              let state = ref initial in
+              for idx = block.cb_start to block.cb_end do
+                let instr = rewrite !state cfg.cfg_instrs.(idx) in
+                state := transfer !state instr
+              done;
+              Some !state
+          in
+          if not (option_equal in_states.(block_id) incoming) ||
+             not (option_equal out_states.(block_id) outgoing) then begin
+            in_states.(block_id) <- incoming;
+            out_states.(block_id) <- outgoing;
+            changed := true
+          end
+        end
+      done
+    done;
+    let rewritten = Array.copy cfg.cfg_instrs in
+    Array.iteri (fun block_id block ->
+      match in_states.(block_id) with
+      | None -> ()
+      | Some incoming ->
+        let state = ref incoming in
+        for idx = block.cb_start to block.cb_end do
+          let instr = rewrite !state rewritten.(idx) in
+          rewritten.(idx) <- instr;
+          state := transfer !state instr
+        done
+    ) cfg.cfg_blocks;
+    { f with fir_body = Array.to_list rewritten }
+
 (* --- Value substitution for copy propagation --- *)
 
 let rec subst_val (subst : (vreg, value) Hashtbl.t) (v : value) : value =
@@ -578,6 +714,74 @@ let dead_store_elim (instrs : instr list) : instr list =
   |> List.map remove_overwritten_stores_in_block
   |> List.fold_left (@) []
 
+(* Backward memory liveness for non-escaping local slots.  A store is dead
+   when no path from it reads the slot before another store.  This is the
+   MemorySSA-style whole-CFG counterpart of the older basic-block overwrite
+   scan; function exit observes no local slots and calls cannot alias them. *)
+let global_dead_store_elim (instrs : instr list) : instr list =
+  let cfg = build_cfg instrs in
+  let block_count = Array.length cfg.cfg_blocks in
+  if block_count = 0 then instrs
+  else
+    let uses = Array.make block_count IntSet.empty in
+    let defs = Array.make block_count IntSet.empty in
+    Array.iteri (fun block_id block ->
+      let defined = ref IntSet.empty in
+      for idx = block.cb_start to block.cb_end do
+        match cfg.cfg_instrs.(idx) with
+        | Lw (_, 0, offset) ->
+          if not (IntSet.mem offset !defined) then
+            uses.(block_id) <- IntSet.add offset uses.(block_id)
+        | Sw (0, offset, _) ->
+          defined := IntSet.add offset !defined;
+          defs.(block_id) <- IntSet.add offset defs.(block_id)
+        | _ -> ()
+      done
+    ) cfg.cfg_blocks;
+    let live_in = Array.make block_count IntSet.empty in
+    let live_out = Array.make block_count IntSet.empty in
+    let changed = ref true in
+    while !changed do
+      changed := false;
+      for block_id = block_count - 1 downto 0 do
+        let outgoing =
+          List.fold_left (fun live successor ->
+            IntSet.union live live_in.(successor)
+          ) IntSet.empty cfg.cfg_blocks.(block_id).cb_succs
+        in
+        let incoming =
+          IntSet.union uses.(block_id)
+            (IntSet.diff outgoing defs.(block_id))
+        in
+        if not (IntSet.equal outgoing live_out.(block_id)) ||
+           not (IntSet.equal incoming live_in.(block_id)) then begin
+          live_out.(block_id) <- outgoing;
+          live_in.(block_id) <- incoming;
+          changed := true
+        end
+      done
+    done;
+    let keep = Array.make (Array.length cfg.cfg_instrs) true in
+    Array.iteri (fun block_id block ->
+      let live = ref live_out.(block_id) in
+      for idx = block.cb_end downto block.cb_start do
+        match cfg.cfg_instrs.(idx) with
+        | Lw (_, 0, offset) ->
+          live := IntSet.add offset !live
+        | Sw (0, offset, _) ->
+          if IntSet.mem offset !live then
+            live := IntSet.remove offset !live
+          else
+            keep.(idx) <- false
+        | _ -> ()
+      done
+    ) cfg.cfg_blocks;
+    let result = ref [] in
+    Array.iteri (fun idx instr ->
+      if keep.(idx) then result := instr :: !result
+    ) cfg.cfg_instrs;
+    List.rev !result
+
 (* --- Pass 5: Dead Code Elimination --- *)
 
 let dead_code_elim (instrs : instr list) : instr list =
@@ -703,6 +907,55 @@ let find_max_vreg (body : instr list) : int =
     | Ret None | Jmp _ | Label _ -> ()
   ) body;
   !max_r
+
+(* Reuse a dominating quotient for a remainder with identical operands:
+     q = x / C; r = x % C
+   becomes
+     q = x / C; product = q * C; r = x - product.
+   LLVM performs the analogous div/rem pairing during value combining.  The
+   rewrite is local to a basic block and invalidates entries on mutable-vreg
+   redefinitions, so it is also safe after register-style slot promotion. *)
+let combine_div_rem (body : instr list) : instr list =
+  let next_vreg = ref (find_max_vreg body + 1) in
+  let rewrite_block block =
+    let quotients = Hashtbl.create 16 in
+    let invalidate reg =
+      Hashtbl.filter_map_inplace (fun (value, _) quotient ->
+        let value_uses_reg =
+          match value with VReg source -> source = reg | VImm _ -> false
+        in
+        if quotient = reg || value_uses_reg then None else Some quotient
+      ) quotients
+    in
+    let result = ref [] in
+    let append instr = result := instr :: !result in
+    List.iter (fun instr ->
+      (match def_vreg instr with Some reg -> invalidate reg | None -> ());
+      match instr with
+      | Binop (rd, Div, dividend, VImm divisor)
+        when normalize_i32 divisor <> 0 ->
+        append instr;
+        Hashtbl.replace quotients
+          (dividend, normalize_i32 divisor) rd
+      | Binop (rd, Mod, dividend, VImm divisor)
+        when normalize_i32 divisor <> 0 ->
+        (match Hashtbl.find_opt quotients
+                 (dividend, normalize_i32 divisor) with
+         | Some quotient ->
+           let product = !next_vreg in
+           incr next_vreg;
+           append (Binop (product, Mul, VReg quotient,
+                     VImm (normalize_i32 divisor)));
+           append (Binop (rd, Sub, dividend, VReg product))
+         | None -> append instr)
+      | _ -> append instr
+    ) block;
+    List.rev !result
+  in
+  body
+  |> split_blocks
+  |> List.map rewrite_block
+  |> List.fold_left (@) []
 
 (* Direct self tail calls reuse the current frame.  Arguments have already
    been evaluated into vregs, so storing them to parameter slots implements
@@ -886,6 +1139,14 @@ let signed_power_of_two value =
   let magnitude = if value < 0 then -value else value in
   positive_power_of_two magnitude
 
+let cheap_multiply_constant value =
+  let value = normalize_i32 value in
+  let magnitude = if value < 0 then -value else value in
+  magnitude > 1 &&
+  (positive_power_of_two magnitude ||
+   positive_power_of_two (magnitude - 1) ||
+   positive_power_of_two (magnitude + 1))
+
 (* Constants that require a temporary register in the final RV32 sequence
    should not be materialized on every hot-loop iteration. *)
 let materialize_loop_constants (f : func_ir) : func_ir =
@@ -914,8 +1175,12 @@ let materialize_loop_constants (f : func_ir) : func_ir =
         else
           match op, side with
           | (Div | Mod), `Left -> true
-          | (Div | Mod), `Right -> not (signed_power_of_two value)
-          | Mul, _ -> not (positive_power_of_two value)
+          (* Keep an immediate divisor visible to codegen: powers of two use
+             shifts and all other constants use a magic multiply-high
+             sequence.  Turning it into a vreg here would force a hardware
+             div/rem in the hot loop. *)
+          | (Div | Mod), `Right -> false
+          | Mul, _ -> not (cheap_multiply_constant value)
           | Add, _ -> not (fits_i12 value)
           | Sub, `Left -> true
           | Sub, `Right ->
@@ -1502,17 +1767,15 @@ let unroll_proven_counted_loops (f : func_ir) : func_ir =
                               removed.(idx) <- true
                             done
                           | None ->
-                            let factor =
-                              if Int64.compare trip 0L > 0 &&
-                                 Int64.rem trip 4L = 0L then 4
-                              else if Int64.compare trip 0L > 0 &&
-                                      Int64.rem trip 2L = 0L then 2
-                              else 1
+                            let full_unroll =
+                              Int64.compare trip 0L > 0 &&
+                              Int64.compare trip 16L <= 0 &&
+                              Int64.to_int trip * List.length body <= 192
                             in
-                            if factor > 1 then begin
-                              let copies = ref [] in
+                            if full_unroll then begin
+                              let copies = ref body in
                               let previous_update = ref update_reg in
-                              for _ = 2 to factor do
+                              for _ = 2 to Int64.to_int trip do
                                 let cloned, cloned_update =
                                   clone_body body
                                     [induction_reg, !previous_update] update_reg
@@ -1520,8 +1783,45 @@ let unroll_proven_counted_loops (f : func_ir) : func_ir =
                                 copies := !copies @ cloned;
                                 previous_update := cloned_update
                               done;
-                              replacement.(exit_idx - 1) <-
-                                Some (!copies @ [Jmp header])
+                              (* Retain the header label and the first
+                                 condition's value-producing prefix.  The
+                                 now-unused comparison is removed by DCE, and
+                                 keeping the induction load makes body values
+                                 that reuse the condition register available
+                                 to the first straight-line copy. *)
+                              let condition_prefix =
+                                Array.to_list
+                                  (Array.sub arr header_idx
+                                     (cond_end - header_idx))
+                              in
+                              replacement.(header_idx) <-
+                                Some (condition_prefix @ !copies);
+                              for idx = header_idx + 1 to exit_idx - 1 do
+                                removed.(idx) <- true
+                              done
+                            end else begin
+                              let factor =
+                                if Int64.compare trip 0L > 0 &&
+                                   Int64.rem trip 4L = 0L then 4
+                                else if Int64.compare trip 0L > 0 &&
+                                        Int64.rem trip 2L = 0L then 2
+                                else 1
+                              in
+                              if factor > 1 then begin
+                                let copies = ref [] in
+                                let previous_update = ref update_reg in
+                                for _ = 2 to factor do
+                                  let cloned, cloned_update =
+                                    clone_body body
+                                      [induction_reg, !previous_update]
+                                      update_reg
+                                  in
+                                  copies := !copies @ cloned;
+                                  previous_update := cloned_update
+                                done;
+                                replacement.(exit_idx - 1) <-
+                                  Some (!copies @ [Jmp header])
+                              end
                             end)
                        | _ -> ())
                     | _ -> ())
@@ -1659,6 +1959,49 @@ let cache_loop_slots (f : func_ir) : func_ir =
       done;
       { f with fir_body = List.rev !result }
 
+(* Promote every non-escaping source local from its stack slot to a mutable
+   virtual register.
+
+   LLVM's mem2reg constructs SSA values and inserts phi nodes at control-flow
+   joins.  This IR deliberately permits a virtual register to have multiple
+   definitions, so one mutable virtual register per source slot is the direct
+   equivalent: the CFG itself selects the reaching definition.  The register
+   allocator already computes liveness over the CFG and supports the mutable
+   cache registers introduced by the older loop-only promotion.
+
+   ToyC has neither pointers nor address-of, hence an [sp + offset] source
+   slot cannot escape or alias another function.  Calls therefore need no
+   flush/reload sequence; a promoted value that is live across a call is
+   constrained to a callee-saved register (or spilled) by reg_alloc.ml.
+   Actual spilling is left to the graph colorer, which has better loop-depth
+   and interference information than a fixed "cache at most N slots" rule. *)
+let promote_local_slots (f : func_ir) : func_ir =
+  let offsets =
+    List.fold_left (fun slots -> function
+      | Lw (_, 0, offset) | Sw (0, offset, _) ->
+        IntSet.add offset slots
+      | _ -> slots
+    ) IntSet.empty f.fir_body
+  in
+  if IntSet.is_empty offsets then f
+  else
+    let next_vreg = ref (find_max_vreg f.fir_body + 1) in
+    let slot_registers = Hashtbl.create (IntSet.cardinal offsets) in
+    IntSet.iter (fun offset ->
+      Hashtbl.add slot_registers offset !next_vreg;
+      incr next_vreg
+    ) offsets;
+    let promoted =
+      List.map (function
+        | Lw (rd, 0, offset) ->
+          Mov (rd, VReg (Hashtbl.find slot_registers offset))
+        | Sw (0, offset, value) ->
+          Mov (Hashtbl.find slot_registers offset, value)
+        | instr -> instr
+      ) f.fir_body
+    in
+    { f with fir_body = promoted }
+
 (* --- Driver for the local passes --- *)
 
 let optimize_func_body (body : instr list) : instr list =
@@ -1671,7 +2014,8 @@ let optimize_func_body (body : instr list) : instr list =
         |> copy_prop
         |> combine_constant_chains
         |> strength_reduce
-        |> dead_store_elim
+        |> combine_div_rem
+        |> global_dead_store_elim
         |> dead_code_elim
         |> peephole
         |> remove_dead_after_jmp
@@ -1874,7 +2218,7 @@ let optimize_func (f : func_ir) : func_ir =
     if iter >= max_iterations then f
     else
     let f1 = global_const_prop f in
-    let f2 = cse_func f1 in
+    let f2 = global_copy_prop f1 |> cse_func in
     let f3 = { f2 with fir_body = optimize_func_body f2.fir_body } in
     let f4 =
       { f3 with fir_body = remove_unreachable_blocks f3.fir_body }
@@ -1892,12 +2236,13 @@ let optimize_func (f : func_ir) : func_ir =
     |> loop 0
     |> materialize_loop_constants
     |> rotate_simple_while_loops
-    |> cache_tailrec_params
-    |> cache_loop_slots
+    |> promote_local_slots
   in
   { optimized with
     fir_body =
       optimized.fir_body
+      |> const_fold
+      |> alg_simplify
       |> fold_defs_into_moves
       |> copy_prop
       |> strength_reduce
@@ -1918,7 +2263,10 @@ let inline_small_leaf_functions (m : module_ir) : module_ir =
   let templates = Hashtbl.create (List.length m.mir_functions) in
   let is_inline_candidate f =
     f.fir_name <> "main" &&
-    List.length f.fir_body <= 120 &&
+    (* A larger threshold than the original straight-line-only inliner is
+       profitable for ToyC: removing a helper call also exposes its local
+       slots, constants and loops to the caller's whole-function passes. *)
+    List.length f.fir_body <= 220 &&
     not (List.exists (function Call _ -> true | _ -> false) f.fir_body)
   in
   List.iter (fun f ->
@@ -2072,6 +2420,198 @@ let inline_small_leaf_functions (m : module_ir) : module_ir =
   in
   { m with mir_functions = List.map inline_in_function m.mir_functions }
 
+(* Recover the symbolic global referenced by address virtual registers.  IR
+   generation emits [la] immediately before a global access, while CSE may
+   later replace another [la] with a copy of an existing address. *)
+let global_address_map (body : instr list) =
+  let addresses = Hashtbl.create 32 in
+  List.iter (function
+    | La (rd, name) -> Hashtbl.replace addresses rd name
+    | _ -> ()
+  ) body;
+  let changed = ref true in
+  while !changed do
+    changed := false;
+    List.iter (function
+      | Mov (rd, VReg source) ->
+        (match Hashtbl.find_opt addresses source with
+         | Some name when Hashtbl.find_opt addresses rd <> Some name ->
+           Hashtbl.replace addresses rd name;
+           changed := true
+         | _ -> ())
+      | _ -> ()
+    ) body
+  done;
+  addresses
+
+(* LLVM's GlobalOpt can turn an internal global into a constant when the
+   whole module proves that it is never modified.  Every ToyC compilation
+   unit is closed and the language has no pointers, so a store through an
+   unknown non-stack base is the only conservative escape case. *)
+let propagate_readonly_globals (m : module_ir) : module_ir =
+  let initial_values =
+    List.fold_left (fun values (name, value) ->
+      StringMap.add name (normalize_i32 value) values
+    ) StringMap.empty m.mir_globals
+  in
+  if StringMap.is_empty initial_values then m
+  else
+    let written = ref StringMap.empty in
+    let unknown_store = ref false in
+    List.iter (fun f ->
+      let addresses = global_address_map f.fir_body in
+      List.iter (function
+        | Sw (0, _, _) -> ()
+        | Sw (base, 0, _) ->
+          (match Hashtbl.find_opt addresses base with
+           | Some name -> written := StringMap.add name () !written
+           | None -> unknown_store := true)
+        | Sw _ -> unknown_store := true
+        | _ -> ()
+      ) f.fir_body
+    ) m.mir_functions;
+    if !unknown_store then m
+    else
+      let rewrite_function f =
+        let addresses = global_address_map f.fir_body in
+        let body =
+          List.map (function
+            | Lw (rd, base, 0) ->
+              (match Hashtbl.find_opt addresses base with
+               | Some name when not (StringMap.mem name !written) ->
+                 (match StringMap.find_opt name initial_values with
+                  | Some value -> Li (rd, value)
+                  | None -> Lw (rd, base, 0))
+               | _ -> Lw (rd, base, 0))
+            | instr -> instr
+          ) f.fir_body
+        in
+        { f with fir_body = body }
+      in
+      { m with mir_functions = List.map rewrite_function m.mir_functions }
+
+(* Promote repeatedly accessed globals inside call-free functions.  Unlike a
+   local slot, a mutable global is observable by its caller, so non-main
+   functions write dirty caches back on every return.  A call-free function
+   cannot have its cached value invalidated while it runs. *)
+let promote_hot_leaf_globals (m : module_ir) : module_ir =
+  if m.mir_globals = [] then m
+  else
+    let rewrite_function f =
+      if List.exists (function Call _ -> true | _ -> false) f.fir_body then f
+      else
+        let body_array = Array.of_list f.fir_body in
+        let addresses = global_address_map f.fir_body in
+        let cfg = build_cfg f.fir_body in
+        let loop_ranges =
+          Array.fold_left (fun ranges block ->
+            List.fold_left (fun ranges successor ->
+              if successor <= block.cb_id then
+                (cfg.cfg_blocks.(successor).cb_start, block.cb_end) :: ranges
+              else ranges
+            ) ranges block.cb_succs
+          ) [] cfg.cfg_blocks
+        in
+        let in_loop idx =
+          List.exists (fun (first, last) -> idx >= first && idx <= last)
+            loop_ranges
+        in
+        let accesses = Hashtbl.create 16 in
+        let note name idx is_write =
+          let count, hot, written =
+            match Hashtbl.find_opt accesses name with
+            | Some info -> info
+            | None -> (0, false, false)
+          in
+          Hashtbl.replace accesses name
+            (count + 1, hot || in_loop idx, written || is_write)
+        in
+        Array.iteri (fun idx -> function
+          | Lw (_, base, 0) ->
+            Option.iter (fun name -> note name idx false)
+              (Hashtbl.find_opt addresses base)
+          | Sw (base, 0, _) when base <> 0 ->
+            Option.iter (fun name -> note name idx true)
+              (Hashtbl.find_opt addresses base)
+          | _ -> ()
+        ) body_array;
+        let selected =
+          Hashtbl.to_seq accesses
+          |> List.of_seq
+          |> List.filter (fun (_, (count, hot, _)) -> hot || count >= 3)
+          |> List.sort (fun (left, _) (right, _) -> compare left right)
+        in
+        if selected = [] then f
+        else
+          let next_vreg = ref (find_max_vreg f.fir_body + 1) in
+          let caches = Hashtbl.create (List.length selected) in
+          let preheader = ref [] in
+          List.iter (fun (name, _) ->
+            let address = !next_vreg in
+            let cache = address + 1 in
+            next_vreg := cache + 1;
+            Hashtbl.add caches name cache;
+            preheader := !preheader @ [La (address, name); Lw (cache, address, 0)]
+          ) selected;
+          let rewritten =
+            List.map (function
+              | Lw (rd, base, 0) ->
+                (match Hashtbl.find_opt addresses base with
+                 | Some name when Hashtbl.mem caches name ->
+                   Mov (rd, VReg (Hashtbl.find caches name))
+                 | _ -> Lw (rd, base, 0))
+              | Sw (base, 0, value) when base <> 0 ->
+                (match Hashtbl.find_opt addresses base with
+                 | Some name when Hashtbl.mem caches name ->
+                   Mov (Hashtbl.find caches name, value)
+                 | _ -> Sw (base, 0, value))
+              | instr -> instr
+            ) f.fir_body
+          in
+          let dirty_names =
+            List.filter_map (fun (name, (_, _, written)) ->
+              if written then Some name else None
+            ) selected
+          in
+          let flushes () =
+            List.concat_map (fun name ->
+              let address = !next_vreg in
+              incr next_vreg;
+              [La (address, name);
+               Sw (address, 0, VReg (Hashtbl.find caches name))]
+            ) dirty_names
+          in
+          let rewritten =
+            if f.fir_name = "main" || dirty_names = [] then rewritten
+            else
+              List.concat_map (function
+                | Ret _ as ret -> flushes () @ [ret]
+                | instr -> [instr]
+              ) rewritten
+          in
+          { f with fir_body = !preheader @ rewritten }
+    in
+    { m with mir_functions = List.map rewrite_function m.mir_functions }
+
+(* Global-cache promotion runs after the structural loop passes.  Re-running
+   the complete optimizer here would let CFG constant propagation turn a
+   deliberately hoisted large loop constant back into an immediate in the
+   rotated latch.  Use a local fixed-point cleanup instead. *)
+let cleanup_promoted_function (f : func_ir) : func_ir =
+  let f = global_copy_prop f in
+  let body =
+    f.fir_body
+    |> optimize_func_body
+    |> fold_defs_into_moves
+    |> const_fold
+    |> copy_prop
+    |> dead_code_elim
+    |> peephole
+    |> remove_dead_after_jmp
+    |> remove_unused_labels
+  in
+  { f with fir_body = body }
+
 let optimize_module (m : module_ir) : module_ir =
   let rec inline_bottom_up rounds current =
     if rounds = 0 then current
@@ -2080,6 +2620,17 @@ let optimize_module (m : module_ir) : module_ir =
       if next = current then current
       else inline_bottom_up (rounds - 1) next
   in
-  let inlined = inline_bottom_up 3 m in
-  { inlined with
-    mir_functions = List.map optimize_func inlined.mir_functions }
+  let inlined =
+    m
+    |> propagate_readonly_globals
+    |> inline_bottom_up 6
+    |> propagate_readonly_globals
+  in
+  let optimized =
+    { inlined with
+      mir_functions = List.map optimize_func inlined.mir_functions }
+  in
+  let promoted = promote_hot_leaf_globals optimized in
+  { promoted with
+    mir_functions =
+      List.map cleanup_promoted_function promoted.mir_functions }

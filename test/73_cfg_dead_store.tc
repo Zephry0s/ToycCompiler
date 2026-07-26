@@ -1,0 +1,14 @@
+int choose(int flag) {
+  int value = 1;
+  if (flag) {
+    value = 2;
+  } else {
+    value = 3;
+  }
+  value = 4;
+  return value;
+}
+
+int main() {
+  return choose(0) + choose(1);
+}

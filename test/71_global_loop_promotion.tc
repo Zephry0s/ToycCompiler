@@ -1,0 +1,14 @@
+int scale = 7;
+int state = 3;
+
+int main() {
+  int i = 0;
+  int sum = 0;
+  while (i < 20) {
+    sum = sum + scale;
+    state = state + 1;
+    sum = sum + state;
+    i = i + 1;
+  }
+  return sum + state;
+}
