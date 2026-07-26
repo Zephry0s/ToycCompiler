@@ -42,7 +42,7 @@ let s2i = string_of_int
 
 let rec try_eval_const (st : scope_stack) (e : exp) : int =
   match e with
-  | Num n -> n
+  | Num n -> normalize_i32 n
   | Id name ->
     (match lookup st name with
      | Some (SymConst v) | Some (SymVarVal v) -> v
@@ -54,25 +54,13 @@ let rec try_eval_const (st : scope_stack) (e : exp) : int =
      | Or  -> if vl <> 0 then 1 else if try_eval_const st r <> 0 then 1 else 0
      | _ ->
        let vr = try_eval_const st r in
-       match op with
-       | Add -> vl + vr
-       | Sub -> vl - vr
-       | Mul -> vl * vr
-       | Div -> if vr = 0 then failwith "division by zero" else vl / vr
-       | Mod -> if vr = 0 then failwith "division by zero" else vl mod vr
-       | Eq  -> if vl = vr  then 1 else 0
-       | Neq -> if vl <> vr then 1 else 0
-       | Lt  -> if vl < vr  then 1 else 0
-       | Gt  -> if vl > vr  then 1 else 0
-       | Le  -> if vl <= vr then 1 else 0
-       | Ge  -> if vl >= vr then 1 else 0
-       | And | Or -> assert false)
+       if (op = Div || op = Mod) && normalize_i32 vr = 0 then
+         failwith "division by zero"
+       else
+         eval_i32_binop op vl vr)
   | Unary (op, e) ->
     let v = try_eval_const st e in
-    (match op with
-     | Neg -> -v
-     | Pos -> v
-     | Not -> if v = 0 then 1 else 0)
+    eval_i32_uop op v
   | Call _ ->
     failwith "function call not allowed in const initializer"
 

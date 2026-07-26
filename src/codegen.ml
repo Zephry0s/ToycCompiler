@@ -47,6 +47,28 @@ let log2_power_of_two n =
   in
   loop 0 n
 
+let is_compare = function
+  | Eq | Neq | Lt | Gt | Le | Ge -> true
+  | Add | Sub | Mul | Div | Mod | And | Or -> false
+
+let emit_compare_branch buf spill_base reg_map branch_if_true op v1 v2 label =
+  let (r1, l1) = resolve_src reg_map spill_base spill_temp1 v1 in
+  let (r2, l2) = resolve_src reg_map spill_base spill_temp2 v2 in
+  let mnemonic, lhs, rhs =
+    match op, branch_if_true with
+    | Eq, true  | Neq, false -> ("beq", r1, r2)
+    | Eq, false | Neq, true  -> ("bne", r1, r2)
+    | Lt, true  | Ge, false  -> ("blt", r1, r2)
+    | Lt, false | Ge, true   -> ("bge", r1, r2)
+    | Gt, true  | Le, false  -> ("blt", r2, r1)
+    | Gt, false | Le, true   -> ("bge", r2, r1)
+    | _ -> assert false
+  in
+  Buffer.add_string buf l1;
+  Buffer.add_string buf l2;
+  Buffer.add_string buf
+    (Printf.sprintf "  %s %s, %s, %s\n" mnemonic lhs rhs label)
+
 let emit_one buf spill_base reg_map = function
   | Binop (rd, Add, v, VImm n) when fits_imm12 n ->
     let (src, load) = resolve_src reg_map spill_base spill_temp1 v in
@@ -338,18 +360,60 @@ let emit_func buf f (fa : func_alloc) =
     end
   done;
 
+  let use_counts = Hashtbl.create 64 in
+  let note_value = function
+    | VImm _ | VReg 0 -> ()
+    | VReg r ->
+      let old =
+        match Hashtbl.find_opt use_counts r with Some n -> n | None -> 0
+      in
+      Hashtbl.replace use_counts r (old + 1)
+  in
   List.iter (function
-    | Ret (Some v) ->
+    | Binop (_, _, v1, v2) -> note_value v1; note_value v2
+    | Unop (_, _, v) | Mov (_, v) -> note_value v
+    | Lw (_, base, _) -> note_value (VReg base)
+    | Sw (base, _, v) -> note_value (VReg base); note_value v
+    | Call (_, _, args) -> List.iter note_value args
+    | Ret (Some v) | Bz (v, _) | Bnz (v, _) -> note_value v
+    | Li _ | La _ | Ret None | Jmp _ | Label _ -> ()
+  ) f.fir_body;
+  let used_once r =
+    Hashtbl.find_opt use_counts r = Some 1
+  in
+  let rec emit_body = function
+    | Binop (rd, op, v1, v2) :: Bz (VReg branch_r, label) :: rest
+      when rd = branch_r && used_once rd && is_compare op ->
+      emit_compare_branch buf spill_base fa.fa_reg_map false op v1 v2 label;
+      emit_body rest
+    | Binop (rd, op, v1, v2) :: Bnz (VReg branch_r, label) :: rest
+      when rd = branch_r && used_once rd && is_compare op ->
+      emit_compare_branch buf spill_base fa.fa_reg_map true op v1 v2 label;
+      emit_body rest
+    | Unop (rd, Not, v) :: Bz (VReg branch_r, label) :: rest
+      when rd = branch_r && used_once rd ->
+      emit_one buf spill_base fa.fa_reg_map (Bnz (v, label));
+      emit_body rest
+    | Unop (rd, Not, v) :: Bnz (VReg branch_r, label) :: rest
+      when rd = branch_r && used_once rd ->
+      emit_one buf spill_base fa.fa_reg_map (Bz (v, label));
+      emit_body rest
+    | Ret (Some v) :: rest ->
       let (rv, lv) = resolve_src fa.fa_reg_map spill_base "a0" v in
       Buffer.add_string buf lv;
       if rv <> "a0" then
         Buffer.add_string buf (Printf.sprintf "  mv a0, %s\n" rv);
-      Buffer.add_string buf (Printf.sprintf "  j %s\n" ret_label)
-    | Ret None ->
-      Buffer.add_string buf (Printf.sprintf "  j %s\n" ret_label)
-    | instr ->
-      emit_one buf spill_base fa.fa_reg_map instr
-  ) f.fir_body;
+      Buffer.add_string buf (Printf.sprintf "  j %s\n" ret_label);
+      emit_body rest
+    | Ret None :: rest ->
+      Buffer.add_string buf (Printf.sprintf "  j %s\n" ret_label);
+      emit_body rest
+    | instr :: rest ->
+      emit_one buf spill_base fa.fa_reg_map instr;
+      emit_body rest
+    | [] -> ()
+  in
+  emit_body f.fir_body;
 
   Buffer.add_string buf (Printf.sprintf "%s:\n" ret_label);
   if f.fir_name = "main" then begin

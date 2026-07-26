@@ -1,0 +1,13 @@
+int accumulate(int count, int left, int right) {
+  int i = 0;
+  int result = 0;
+  while (i < count) {
+    result = result + left * right + 3;
+    i = i + 1;
+  }
+  return result;
+}
+
+int main() {
+  return accumulate(10, 4, 5);
+}
