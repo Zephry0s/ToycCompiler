@@ -24,8 +24,11 @@ let leave_scope (st : scope_stack) : scope_stack =
 
 let add_symbol (st : scope_stack) name sym : scope_stack =
   match st with
-  | [] -> [StringMap.add name sym StringMap.empty]
-  | cur :: rest -> StringMap.add name sym cur :: rest
+  | [] -> [StringMap.singleton name sym]
+  | cur :: rest ->
+    if StringMap.mem name cur then
+      failwith ("duplicate declaration '" ^ name ^ "' in the same scope");
+    StringMap.add name sym cur :: rest
 
 let rec lookup (st : scope_stack) name : symbol option =
   match st with

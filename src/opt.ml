@@ -143,6 +143,15 @@ let alg_simplify (instrs : instr list) : instr list =
     | _ -> i
   ) instrs
 
+(* --- Pass 2.5: Strength Reduction --- *)
+
+let strength_reduce (instrs : instr list) : instr list =
+  List.map (fun i -> match i with
+    | Binop (rd, Mul, v, VImm 2) | Binop (rd, Mul, VImm 2, v) ->
+      Binop (rd, Add, v, v)
+    | _ -> i
+  ) instrs
+
 (* --- Pass 3: Copy Propagation --- *)
 
 let copy_prop_block (instrs : instr list) : instr list =
@@ -261,6 +270,197 @@ let remove_dead_after_jmp (instrs : instr list) : instr list =
   done;
   List.rev !result
 
+(* ================================================================
+ * Loop Unrolling
+ * ================================================================ *)
+
+module SMap = Map.Make(String)
+module ISet = Set.Make(struct type t = int let compare = compare end)
+module IMap = Map.Make(struct type t = int let compare = compare end)
+
+type bbinfo = {
+  b_start : int;
+  b_end   : int;
+  b_label : string option;
+  mutable b_succs : int list;
+}
+
+let build_cfg (instrs : instr list) : (instr array * bbinfo array) =
+  let arr = Array.of_list instrs in
+  let n = Array.length arr in
+  let starts = Array.make n false in
+  if n > 0 then starts.(0) <- true;
+  for i = 0 to n - 1 do
+    match arr.(i) with
+    | Label _ -> starts.(i) <- true
+    | Jmp _ | Bz _ | Bnz _ | Ret _ ->
+      if i + 1 < n then starts.(i + 1) <- true
+    | _ -> ()
+  done;
+  let blocks = ref [] in
+  let label_map = ref SMap.empty in
+  let block_id = ref 0 in
+  let i = ref 0 in
+  while !i < n do
+    if starts.(!i) then begin
+      let start = !i in
+      let label = match arr.(start) with Label s -> Some s | _ -> None in
+      (match label with Some s -> label_map := SMap.add s !block_id !label_map | None -> ());
+      let j = ref (start + 1) in
+      while !j < n && not starts.(!j) do incr j done;
+      blocks := { b_start = start; b_end = !j - 1; b_label = label; b_succs = [] } :: !blocks;
+      incr block_id;
+      i := !j
+    end else incr i
+  done;
+  let bbs = Array.of_list (List.rev !blocks) in
+  for bid = 0 to Array.length bbs - 1 do
+    let last = arr.(bbs.(bid).b_end) in
+    bbs.(bid).b_succs <- (match last with
+      | Jmp lbl -> (match SMap.find_opt lbl !label_map with Some id -> [id] | None -> [])
+      | Ret _ -> []
+      | Bz (_, lbl) | Bnz (_, lbl) ->
+        let tgt = match SMap.find_opt lbl !label_map with Some id -> [id] | None -> [] in
+        let fall = if bid + 1 < Array.length bbs then [bid + 1] else [] in
+        tgt @ fall
+      | _ -> if bid + 1 < Array.length bbs then [bid + 1] else [])
+  done;
+  (arr, bbs)
+
+let find_max_vreg (body : instr list) : int =
+  let max_r = ref 0 in
+  let check = function VReg r -> if r > !max_r then max_r := r | _ -> () in
+  List.iter (function
+    | Binop (rd, _, v1, v2) -> max_r := max !max_r rd; check v1; check v2
+    | Unop (rd, _, v) | Mov (rd, v) -> max_r := max !max_r rd; check v
+    | Li (rd, _) | Lw (rd, _, _) | La (rd, _) | Call (rd, _, _) ->
+        max_r := max !max_r rd
+    | Sw (_, _, v) -> check v
+    | Ret (Some v) -> check v
+    | Bz (v, _) | Bnz (v, _) -> check v
+    | _ -> ()
+  ) body;
+  !max_r
+
+(* rename vregs in an instruction: old -> new mapping *)
+let rename_instr (rmap : int IMap.t) (i : instr) : instr =
+  let rv = function VReg r -> VReg (try IMap.find r rmap with Not_found -> r)
+                   | v -> v in
+  let rd r = try IMap.find r rmap with Not_found -> r in
+  match i with
+  | Binop (r, op, v1, v2) -> Binop (rd r, op, rv v1, rv v2)
+  | Unop (r, op, v) -> Unop (rd r, op, rv v)
+  | Mov (r, v) -> Mov (rd r, rv v)
+  | Li (r, n) -> Li (rd r, n)
+  | Lw (r, b, off) -> Lw (rd r, b, off)
+  | La (r, name) -> La (rd r, name)
+  | Call (r, name, args) -> Call (rd r, name, List.map rv args)
+  | Sw (b, off, v) -> Sw (b, off, rv v)
+  | Ret (Some v) -> Ret (Some (rv v))
+  | Ret None -> i
+  | Bz (v, lbl) -> Bz (rv v, lbl)
+  | Bnz (v, lbl) -> Bnz (rv v, lbl)
+  | Label _ | Jmp _ -> i
+
+(* collect vregs defined in an instruction list *)
+let collect_defs (instrs : instr list) : ISet.t =
+  let s = ref ISet.empty in
+  List.iter (fun i ->
+    match def_vreg i with Some r -> s := ISet.add r !s | None -> ()
+  ) instrs;
+  !s
+
+let unroll_func (f : func_ir) : func_ir =
+  let arr, bbs = build_cfg f.fir_body in
+  let nbb = Array.length bbs in
+  let loops = ref [] in
+  for bid = 0 to nbb - 1 do
+    List.iter (fun succ ->
+      if succ <= bid then loops := (bid, succ) :: !loops
+    ) bbs.(bid).b_succs
+  done;
+  if !loops = [] then f
+  else begin
+    let max_vreg = find_max_vreg f.fir_body in
+    let next_vreg = ref (max_vreg + 1) in
+    let insert = Array.make (Array.length arr) [] in
+    let remove = Array.make (Array.length arr) false in
+
+    List.iter (fun (tail, header) ->
+      let hstart = bbs.(header).b_start in
+      let hend = bbs.(header).b_end in
+      let tstart = bbs.(tail).b_start in
+      let tend = bbs.(tail).b_end in
+
+      let has_nested = ref false in
+      for j = hend + 1 to tend - 1 do
+        match arr.(j) with
+        | Bz _ | Bnz _ -> has_nested := true
+        | _ -> ()
+      done;
+      if !has_nested then () else begin
+
+      let body_instrs = ref [] in
+      for j = hstart to hend do body_instrs := arr.(j) :: !body_instrs done;
+      for j = tstart to tend do body_instrs := arr.(j) :: !body_instrs done;
+      let body_instrs = List.rev !body_instrs in
+
+      let body_defs = collect_defs body_instrs in
+
+      let trip_opt = ref None in
+      for j = hstart to hend do
+        match arr.(j) with
+        | Li (_, n) when n > 0 && n <= 4 ->
+          trip_opt := Some n
+        | _ -> ()
+      done;
+
+      match !trip_opt with
+      | Some k when k <= 2 ->
+        let tail_body = ref [] in
+        for j = tstart to tend do tail_body := arr.(j) :: !tail_body done;
+        let tail_body = List.rev !tail_body in
+        let body_only = List.filter (fun i ->
+          match i with Label _ | Bz _ | Bnz _ | Jmp _ -> false | _ -> true
+        ) tail_body in
+
+        let copies = ref [] in
+        for _ = 1 to k do
+          copies := (List.rev body_only) :: !copies
+        done;
+        for j = hstart to tend do remove.(j) <- true done;
+        if hstart > 0 then
+          insert.(hstart - 1) <- (List.flatten !copies |> List.rev) @ insert.(hstart - 1)
+
+      | _ ->
+        let body_tail = ref [] in
+        for j = tstart to tend do body_tail := arr.(j) :: !body_tail done;
+        let body_tail = List.rev !body_tail in
+        let body_no_jmp = List.filter (function Jmp _ -> false | _ -> true) body_tail in
+        let body_sz = List.length body_no_jmp in
+        if body_sz >= 5 then begin
+          let rmap = ref IMap.empty in
+          ISet.iter (fun r ->
+            let fresh = !next_vreg in
+            incr next_vreg;
+            rmap := IMap.add r fresh !rmap
+          ) body_defs;
+          let copy = List.map (rename_instr !rmap) body_no_jmp in
+          insert.(tend - 1) <- (List.rev copy) @ insert.(tend - 1)
+        end
+      end
+    ) !loops;
+
+    let result = ref [] in
+    for i = Array.length arr - 1 downto 0 do
+      if not remove.(i) then begin
+        List.iter (fun instr -> result := instr :: !result) insert.(i);
+        result := arr.(i) :: !result
+      end
+    done;
+    { f with fir_body = !result }
+  end
+
 (* --- Driver for the local passes --- *)
 
 let optimize_func_body (body : instr list) : instr list =
@@ -271,6 +471,7 @@ let optimize_func_body (body : instr list) : instr list =
         |> const_fold
         |> alg_simplify
         |> copy_prop
+        |> strength_reduce
         |> dead_code_elim
         |> peephole
         |> remove_dead_after_jmp
@@ -350,7 +551,7 @@ let optimize_func (f : func_ir) : func_ir =
     let f3 = dce f2 in
     if List.length f3.fir_body = List.length f.fir_body then f3 else loop f3
   in
-  loop f
+  loop (unroll_func f)
 
 let optimize_module (m : module_ir) : module_ir =
   { m with mir_functions = List.map optimize_func m.mir_functions }
