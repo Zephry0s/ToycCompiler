@@ -1,0 +1,13 @@
+int main() {
+  int selector = 7;
+  int result = 0;
+  if (selector == 7) {
+    result = 3;
+  } else {
+    result = 100;
+  }
+  while (0) {
+    result = result + 1000;
+  }
+  return result + 4;
+}

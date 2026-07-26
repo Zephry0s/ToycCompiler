@@ -1,0 +1,14 @@
+int checks = 0;
+
+int keep_running(int limit) {
+  checks = checks + 1;
+  return checks <= limit;
+}
+
+int main() {
+  int result = 0;
+  while (keep_running(3)) {
+    result = result + 10;
+  }
+  return result + checks;
+}

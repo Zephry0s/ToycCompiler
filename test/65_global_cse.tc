@@ -1,0 +1,15 @@
+int compute(int left, int right, int choose_first) {
+  int first = left * right + left;
+  int selected = 0;
+  if (choose_first) {
+    selected = first;
+  } else {
+    selected = right;
+  }
+  int second = left * right + left;
+  return selected + second;
+}
+
+int main() {
+  return compute(3, 4, 1);
+}

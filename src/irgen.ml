@@ -61,7 +61,7 @@ let emit ctx i =
 let rec eval_const (global_syms : symbol StringMap.t)
     (local_consts : int StringMap.t) (global_vals : int StringMap.t) (e : exp) : int =
   match e with
-  | Num n -> n
+  | Num n -> normalize_i32 n
   | Id name ->
     (match StringMap.find_opt name local_consts with
      | Some v -> v
@@ -79,20 +79,13 @@ let rec eval_const (global_syms : symbol StringMap.t)
      | Or  -> if vl <> 0 then 1 else if eval_const global_syms local_consts global_vals r <> 0 then 1 else 0
      | _ ->
        let vr = eval_const global_syms local_consts global_vals r in
-       match op with
-       | Add -> vl + vr  | Sub -> vl - vr  | Mul -> vl * vr
-       | Div -> if vr = 0 then failwith "division by zero" else vl / vr
-       | Mod -> if vr = 0 then failwith "division by zero" else vl mod vr
-       | Eq  -> if vl = vr  then 1 else 0
-       | Neq -> if vl <> vr then 1 else 0
-       | Lt  -> if vl < vr  then 1 else 0
-       | Gt  -> if vl > vr  then 1 else 0
-       | Le  -> if vl <= vr then 1 else 0
-       | Ge  -> if vl >= vr then 1 else 0
-       | And | Or -> assert false)
+       if (op = Div || op = Mod) && normalize_i32 vr = 0 then
+         failwith "division by zero"
+       else
+         eval_i32_binop op vl vr)
   | Unary (op, e) ->
     let v = eval_const global_syms local_consts global_vals e in
-    (match op with Neg -> -v | Pos -> v | Not -> if v = 0 then 1 else 0)
+    eval_i32_uop op v
   | Call _ -> failwith "function call in const expression"
 
 let frame_info (global_syms : symbol StringMap.t) (params : param list)
@@ -169,7 +162,7 @@ let rec gen_expr (ctx : ctx) (e : exp) : vreg =
   match e with
   | Num n ->
     let r = new_reg ctx in
-    emit ctx (Li (r, n));
+    emit ctx (Li (r, normalize_i32 n));
     r
   | Id name ->
     (match local_lookup ctx name ctx.cur_scope with
