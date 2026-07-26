@@ -52,7 +52,7 @@ make clean && make
 # 从 stdin 读取
 ./toyc < test/02_add.tc > result/output.s
 
-# 开启优化（DCE + CSE）
+# 开启优化
 ./toyc -opt test/38_prime.tc > result/output.s
 ```
 
@@ -85,9 +85,14 @@ make clean && make
 | 短路求值 | `irgen.ml` | `&&` / `\|\|` 使用跳转指令实现 lazy 求值 |
 | 线性扫描寄存器分配 | `reg_alloc.ml` | 活跃变量分析 + 线性扫描，含 spill；按需保存被调用者保存寄存器（`s0`–`s11`） |
 | 死代码删除（DCE） | `opt.ml` | 删除定义了从未被使用的虚拟寄存器的纯计算指令，迭代至不动点 |
+| 局部死存储删除（DSE） | `opt.ml` | 删除从未读取或读取前已被覆盖的局部栈写入 |
 | 公共子表达式消除（CSE） | `opt.ml` | 基本块内缓存已计算表达式，重复出现时替换为 `mov`，消除冗余计算 |
+| 直接尾递归消除 | `opt.ml` | 参数槽更新后跳回函数体入口，复用当前栈帧 |
+| 循环栈槽缓存 | `opt.ml` | 最内层循环中将高频局部变量保存在虚拟寄存器 |
+| 调用开销优化 | `reg_alloc.ml` / `codegen.ml` | 跨调用值使用 `s` 寄存器或 spill，取消固定保存全部 `t` 寄存器 |
+| 立即数指令选择 | `codegen.ml` | 使用 `addi`、`slti`、`seqz`、`snez`、`slli` |
 
-DCE 和 CSE 在传入 `-opt` 参数时启用，两者交替迭代至不动点。
+完整的优化流程、正确性条件和回归测试见 [OPTIMIZATIONS.md](OPTIMIZATIONS.md)。
 
 ## 测试
 
