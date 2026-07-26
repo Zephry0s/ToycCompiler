@@ -254,9 +254,14 @@ let linear_scan (first_def : int IMap.t) (last_use : int IMap.t) (call_positions
   let intervals = List.sort (fun a b -> compare a.i_start b.i_start) !intervals in
 
   let spans_call iv =
+    (* [Set.find_first] requires a monotone predicate.  Testing both interval
+       bounds with it is not monotone and can miss an earlier call when a
+       function contains many call sites. *)
     try
-      let _ = ISet.find_first (fun pos -> pos >= iv.i_start && pos <= iv.i_end) call_positions in
-      true
+      let next_call =
+        ISet.find_first (fun pos -> pos > iv.i_start) call_positions
+      in
+      next_call < iv.i_end
     with Not_found -> false
   in
 
@@ -270,11 +275,11 @@ let linear_scan (first_def : int IMap.t) (last_use : int IMap.t) (call_positions
   let active = Array.make num_regs (None : (int * int) option) in
   let next_spill = ref 0 in
 
-  let find_free ?(avoid_caller_saved = false) () =
+  let find_free ?(callee_only = false) () =
     let rec loop i =
       if i >= num_regs then None
       else if active.(i) = None then
-        if avoid_caller_saved && is_caller_saved phys_regs.(i) then loop (i + 1)
+        if callee_only && is_caller_saved phys_regs.(i) then loop (i + 1)
         else Some i
       else loop (i + 1)
     in loop 0
@@ -293,11 +298,7 @@ let linear_scan (first_def : int IMap.t) (last_use : int IMap.t) (call_positions
 
     let need_callee = spans_call iv in
     let idx =
-      match find_free ~avoid_caller_saved:need_callee () with
-      | Some i -> Some i
-      | None when need_callee ->
-        find_free ()
-      | None -> None
+      find_free ~callee_only:need_callee ()
     in
 
     (match idx with
@@ -308,26 +309,30 @@ let linear_scan (first_def : int IMap.t) (last_use : int IMap.t) (call_positions
          not (List.mem phys_regs.(idx) !callee_used) then
         callee_used := phys_regs.(idx) :: !callee_used
     | None ->
-      let spill_idx = ref 0 in
+      let spill_idx = ref None in
       let max_end = ref (-1) in
       for i = 0 to num_regs - 1 do
-        match active.(i) with
-        | Some (_, e) when e > !max_end ->
-          spill_idx := i;
+        let eligible =
+          not need_callee || is_callee_saved phys_regs.(i)
+        in
+        match eligible, active.(i) with
+        | true, Some (_, e) when e > !max_end ->
+          spill_idx := Some i;
           max_end := e
         | _ -> ()
       done;
 
-      if !max_end > iv.i_end then begin
-        let spilled = Option.get active.(!spill_idx) in
+      if !max_end > iv.i_end && !spill_idx <> None then begin
+        let idx = Option.get !spill_idx in
+        let spilled = Option.get active.(idx) in
         let off = !next_spill in
         Hashtbl.replace reg_map (fst spilled) (Spill off);
         next_spill := !next_spill + 4;
-        active.(!spill_idx) <- Some (iv.i_vreg, iv.i_end);
-        Hashtbl.replace reg_map iv.i_vreg (Reg phys_regs.(!spill_idx));
-        if is_callee_saved phys_regs.(!spill_idx) &&
-           not (List.mem phys_regs.(!spill_idx) !callee_used) then
-          callee_used := phys_regs.(!spill_idx) :: !callee_used
+        active.(idx) <- Some (iv.i_vreg, iv.i_end);
+        Hashtbl.replace reg_map iv.i_vreg (Reg phys_regs.(idx));
+        if is_callee_saved phys_regs.(idx) &&
+           not (List.mem phys_regs.(idx) !callee_used) then
+          callee_used := phys_regs.(idx) :: !callee_used
       end else begin
         let off = !next_spill in
         Hashtbl.replace reg_map iv.i_vreg (Spill off);

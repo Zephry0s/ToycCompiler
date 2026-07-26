@@ -35,7 +35,101 @@ let riscv_binop = function
   | Add -> "add" | Sub -> "sub" | Mul -> "mul" | Div -> "div" | Mod -> "rem"
   | _ -> "??"
 
+let fits_imm12 n =
+  n >= -2048 && n <= 2047
+
+let is_positive_power_of_two n =
+  n > 0 && n land (n - 1) = 0
+
+let log2_power_of_two n =
+  let rec loop shift value =
+    if value = 1 then shift else loop (shift + 1) (value lsr 1)
+  in
+  loop 0 n
+
 let emit_one buf spill_base reg_map = function
+  | Binop (rd, Add, v, VImm n) when fits_imm12 n ->
+    let (src, load) = resolve_src reg_map spill_base spill_temp1 v in
+    let (dst, store) = resolve_dst reg_map spill_base spill_temp1 rd in
+    Buffer.add_string buf load;
+    Buffer.add_string buf
+      (Printf.sprintf "  addi %s, %s, %d\n" dst src n);
+    Buffer.add_string buf store
+  | Binop (rd, Add, VImm n, v) when fits_imm12 n ->
+    let (src, load) = resolve_src reg_map spill_base spill_temp1 v in
+    let (dst, store) = resolve_dst reg_map spill_base spill_temp1 rd in
+    Buffer.add_string buf load;
+    Buffer.add_string buf
+      (Printf.sprintf "  addi %s, %s, %d\n" dst src n);
+    Buffer.add_string buf store
+  | Binop (rd, Sub, v, VImm n)
+    when n <> min_int && fits_imm12 (-n) ->
+    let (src, load) = resolve_src reg_map spill_base spill_temp1 v in
+    let (dst, store) = resolve_dst reg_map spill_base spill_temp1 rd in
+    Buffer.add_string buf load;
+    Buffer.add_string buf
+      (Printf.sprintf "  addi %s, %s, %d\n" dst src (-n));
+    Buffer.add_string buf store
+  | Binop (rd, Mul, v, VImm n) when is_positive_power_of_two n ->
+    let (src, load) = resolve_src reg_map spill_base spill_temp1 v in
+    let (dst, store) = resolve_dst reg_map spill_base spill_temp1 rd in
+    Buffer.add_string buf load;
+    Buffer.add_string buf
+      (Printf.sprintf "  slli %s, %s, %d\n"
+         dst src (log2_power_of_two n));
+    Buffer.add_string buf store
+  | Binop (rd, Mul, VImm n, v) when is_positive_power_of_two n ->
+    let (src, load) = resolve_src reg_map spill_base spill_temp1 v in
+    let (dst, store) = resolve_dst reg_map spill_base spill_temp1 rd in
+    Buffer.add_string buf load;
+    Buffer.add_string buf
+      (Printf.sprintf "  slli %s, %s, %d\n"
+         dst src (log2_power_of_two n));
+    Buffer.add_string buf store
+  | Binop (rd, Eq, v, VImm 0)
+  | Binop (rd, Eq, VImm 0, v) ->
+    let (src, load) = resolve_src reg_map spill_base spill_temp1 v in
+    let (dst, store) = resolve_dst reg_map spill_base spill_temp1 rd in
+    Buffer.add_string buf load;
+    Buffer.add_string buf (Printf.sprintf "  seqz %s, %s\n" dst src);
+    Buffer.add_string buf store
+  | Binop (rd, Neq, v, VImm 0)
+  | Binop (rd, Neq, VImm 0, v) ->
+    let (src, load) = resolve_src reg_map spill_base spill_temp1 v in
+    let (dst, store) = resolve_dst reg_map spill_base spill_temp1 rd in
+    Buffer.add_string buf load;
+    Buffer.add_string buf (Printf.sprintf "  snez %s, %s\n" dst src);
+    Buffer.add_string buf store
+  | Binop (rd, Lt, v, VImm n)
+  | Binop (rd, Gt, VImm n, v)
+    when fits_imm12 n ->
+    let (src, load) = resolve_src reg_map spill_base spill_temp1 v in
+    let (dst, store) = resolve_dst reg_map spill_base spill_temp1 rd in
+    Buffer.add_string buf load;
+    Buffer.add_string buf
+      (Printf.sprintf "  slti %s, %s, %d\n" dst src n);
+    Buffer.add_string buf store
+  | Binop (rd, Ge, v, VImm n)
+  | Binop (rd, Le, VImm n, v)
+    when fits_imm12 n ->
+    let (src, load) = resolve_src reg_map spill_base spill_temp1 v in
+    let (dst, store) = resolve_dst reg_map spill_base spill_temp1 rd in
+    Buffer.add_string buf load;
+    Buffer.add_string buf
+      (Printf.sprintf "  slti %s, %s, %d\n  xori %s, %s, 1\n"
+         dst src n dst dst);
+    Buffer.add_string buf store
+  | Binop (rd, ((Le | Gt) as op), v, VImm n)
+    when n < max_int && fits_imm12 (n + 1) ->
+    let (src, load) = resolve_src reg_map spill_base spill_temp1 v in
+    let (dst, store) = resolve_dst reg_map spill_base spill_temp1 rd in
+    Buffer.add_string buf load;
+    Buffer.add_string buf
+      (Printf.sprintf "  slti %s, %s, %d\n" dst src (n + 1));
+    if op = Gt then
+      Buffer.add_string buf
+        (Printf.sprintf "  xori %s, %s, 1\n" dst dst);
+    Buffer.add_string buf store
   | Binop (rd, Eq, v1, v2) ->
     let (r1, l1) = resolve_src reg_map spill_base spill_temp1 v1 in
     let (r2, l2) = resolve_src reg_map spill_base spill_temp2 v2 in
@@ -154,13 +248,10 @@ let emit_one buf spill_base reg_map = function
   | Call (rd, fname, args) ->
     let n_args = List.length args in
     let excess = if n_args > 8 then n_args - 8 else 0 in
-    let caller_save_sz = 20 in
-    let call_spill_base = spill_base + excess * 4 + caller_save_sz in
-    let adj = excess * 4 + caller_save_sz in
-    Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" (-adj));
-    List.iteri (fun i reg ->
-      Buffer.add_string buf (Printf.sprintf "  sw %s, %d(sp)\n" reg (excess * 4 + i * 4))
-    ) ["t0"; "t1"; "t2"; "t3"; "t4"];
+    let adj = if excess = 0 then 0 else align16 (excess * 4) in
+    let call_spill_base = spill_base + adj in
+    if adj > 0 then
+      Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" (-adj));
     if excess > 0 then begin
       let rec copy_excess i arg_list =
         match arg_list with
@@ -187,11 +278,8 @@ let emit_one buf spill_base reg_map = function
     let (dst, st) = resolve_dst reg_map call_spill_base spill_temp1 rd in
     Buffer.add_string buf (Printf.sprintf "  mv %s, a0\n" dst);
     Buffer.add_string buf st;
-    List.iteri (fun i reg ->
-      if reg <> dst then
-        Buffer.add_string buf (Printf.sprintf "  lw %s, %d(sp)\n" reg (excess * 4 + i * 4))
-    ) ["t0"; "t1"; "t2"; "t3"; "t4"];
-    Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" adj)
+    if adj > 0 then
+      Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" adj)
   | Ret _ -> ()
   | Jmp label ->
     Buffer.add_string buf (Printf.sprintf "  j %s\n" label)

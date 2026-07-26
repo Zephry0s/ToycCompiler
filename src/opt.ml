@@ -3,6 +3,8 @@ open Ir
 
 let max_iterations = 5
 
+module IntSet = Set.Make(struct type t = int let compare = compare end)
+
 (* --- Utility --- *)
 
 let eval_binop op a b = match op with
@@ -177,7 +179,38 @@ let copy_prop (instrs : instr list) : instr list =
   let blocks' = List.map copy_prop_block blocks in
   List.fold_left (@) [] blocks'
 
-(* --- Pass 4: Dead Code Elimination --- *)
+(* --- Pass 4: Dead local-store elimination --- *)
+
+let remove_overwritten_stores_in_block (instrs : instr list) : instr list =
+  let rec scan seen_store acc = function
+    | [] -> acc
+    | Sw (0, off, _) :: rest when IntSet.mem off seen_store ->
+      scan seen_store acc rest
+    | (Sw (0, off, _) as instr) :: rest ->
+      scan (IntSet.add off seen_store) (instr :: acc) rest
+    | (Lw (_, 0, off) as instr) :: rest ->
+      scan (IntSet.remove off seen_store) (instr :: acc) rest
+    | instr :: rest ->
+      scan seen_store (instr :: acc) rest
+  in
+  scan IntSet.empty [] (List.rev instrs)
+
+let dead_store_elim (instrs : instr list) : instr list =
+  let loaded_slots =
+    List.fold_left (fun slots -> function
+      | Lw (_, 0, off) -> IntSet.add off slots
+      | _ -> slots
+    ) IntSet.empty instrs
+  in
+  instrs
+  |> List.filter (function
+       | Sw (0, off, _) -> IntSet.mem off loaded_slots
+       | _ -> true)
+  |> split_blocks
+  |> List.map remove_overwritten_stores_in_block
+  |> List.fold_left (@) []
+
+(* --- Pass 5: Dead Code Elimination --- *)
 
 let dead_code_elim (instrs : instr list) : instr list =
   let instr_arr = Array.of_list instrs in
@@ -221,7 +254,7 @@ let dead_code_elim (instrs : instr list) : instr list =
   done;
   List.rev !result
 
-(* --- Pass 5: Peephole --- *)
+(* --- Pass 6: Peephole --- *)
 
 let rec peephole_scan (acc : instr list) (instrs : instr list) : instr list =
   match instrs with
@@ -247,7 +280,7 @@ let rec peephole_scan (acc : instr list) (instrs : instr list) : instr list =
 let peephole (instrs : instr list) : instr list =
   peephole_scan [] instrs
 
-(* --- Pass 6: Dead code after unconditional jumps --- *)
+(* --- Pass 7: Dead code after unconditional jumps --- *)
 
 let remove_dead_after_jmp (instrs : instr list) : instr list =
   let arr = Array.of_list instrs in
@@ -271,195 +304,290 @@ let remove_dead_after_jmp (instrs : instr list) : instr list =
   List.rev !result
 
 (* ================================================================
- * Loop Unrolling
+ * Safe loop and recursion optimizations
  * ================================================================ *)
-
-module SMap = Map.Make(String)
-module ISet = Set.Make(struct type t = int let compare = compare end)
-module IMap = Map.Make(struct type t = int let compare = compare end)
-
-type bbinfo = {
-  b_start : int;
-  b_end   : int;
-  b_label : string option;
-  mutable b_succs : int list;
-}
-
-let build_cfg (instrs : instr list) : (instr array * bbinfo array) =
-  let arr = Array.of_list instrs in
-  let n = Array.length arr in
-  let starts = Array.make n false in
-  if n > 0 then starts.(0) <- true;
-  for i = 0 to n - 1 do
-    match arr.(i) with
-    | Label _ -> starts.(i) <- true
-    | Jmp _ | Bz _ | Bnz _ | Ret _ ->
-      if i + 1 < n then starts.(i + 1) <- true
-    | _ -> ()
-  done;
-  let blocks = ref [] in
-  let label_map = ref SMap.empty in
-  let block_id = ref 0 in
-  let i = ref 0 in
-  while !i < n do
-    if starts.(!i) then begin
-      let start = !i in
-      let label = match arr.(start) with Label s -> Some s | _ -> None in
-      (match label with Some s -> label_map := SMap.add s !block_id !label_map | None -> ());
-      let j = ref (start + 1) in
-      while !j < n && not starts.(!j) do incr j done;
-      blocks := { b_start = start; b_end = !j - 1; b_label = label; b_succs = [] } :: !blocks;
-      incr block_id;
-      i := !j
-    end else incr i
-  done;
-  let bbs = Array.of_list (List.rev !blocks) in
-  for bid = 0 to Array.length bbs - 1 do
-    let last = arr.(bbs.(bid).b_end) in
-    bbs.(bid).b_succs <- (match last with
-      | Jmp lbl -> (match SMap.find_opt lbl !label_map with Some id -> [id] | None -> [])
-      | Ret _ -> []
-      | Bz (_, lbl) | Bnz (_, lbl) ->
-        let tgt = match SMap.find_opt lbl !label_map with Some id -> [id] | None -> [] in
-        let fall = if bid + 1 < Array.length bbs then [bid + 1] else [] in
-        tgt @ fall
-      | _ -> if bid + 1 < Array.length bbs then [bid + 1] else [])
-  done;
-  (arr, bbs)
 
 let find_max_vreg (body : instr list) : int =
   let max_r = ref 0 in
-  let check = function VReg r -> if r > !max_r then max_r := r | _ -> () in
+  let check_reg r = if r > !max_r then max_r := r in
+  let check_val = function VReg r -> check_reg r | VImm _ -> () in
   List.iter (function
-    | Binop (rd, _, v1, v2) -> max_r := max !max_r rd; check v1; check v2
-    | Unop (rd, _, v) | Mov (rd, v) -> max_r := max !max_r rd; check v
-    | Li (rd, _) | Lw (rd, _, _) | La (rd, _) | Call (rd, _, _) ->
-        max_r := max !max_r rd
-    | Sw (_, _, v) -> check v
-    | Ret (Some v) -> check v
-    | Bz (v, _) | Bnz (v, _) -> check v
-    | _ -> ()
+    | Binop (rd, _, v1, v2) -> check_reg rd; check_val v1; check_val v2
+    | Unop (rd, _, v) | Mov (rd, v) -> check_reg rd; check_val v
+    | Li (rd, _) | La (rd, _) -> check_reg rd
+    | Lw (rd, base, _) -> check_reg rd; check_reg base
+    | Sw (base, _, v) -> check_reg base; check_val v
+    | Call (rd, _, args) -> check_reg rd; List.iter check_val args
+    | Ret (Some v) | Bz (v, _) | Bnz (v, _) -> check_val v
+    | Ret None | Jmp _ | Label _ -> ()
   ) body;
   !max_r
 
-(* rename vregs in an instruction: old -> new mapping *)
-let rename_instr (rmap : int IMap.t) (i : instr) : instr =
-  let rv = function VReg r -> VReg (try IMap.find r rmap with Not_found -> r)
-                   | v -> v in
-  let rd r = try IMap.find r rmap with Not_found -> r in
-  match i with
-  | Binop (r, op, v1, v2) -> Binop (rd r, op, rv v1, rv v2)
-  | Unop (r, op, v) -> Unop (rd r, op, rv v)
-  | Mov (r, v) -> Mov (rd r, rv v)
-  | Li (r, n) -> Li (rd r, n)
-  | Lw (r, b, off) -> Lw (rd r, b, off)
-  | La (r, name) -> La (rd r, name)
-  | Call (r, name, args) -> Call (rd r, name, List.map rv args)
-  | Sw (b, off, v) -> Sw (b, off, rv v)
-  | Ret (Some v) -> Ret (Some (rv v))
-  | Ret None -> i
-  | Bz (v, lbl) -> Bz (rv v, lbl)
-  | Bnz (v, lbl) -> Bnz (rv v, lbl)
-  | Label _ | Jmp _ -> i
+(* Direct self tail calls reuse the current frame.  Arguments have already
+   been evaluated into vregs, so storing them to parameter slots implements
+   the required parallel assignment before jumping back to the body entry. *)
+let tail_rec_elim (f : func_ir) : func_ir =
+  let param_count = List.length f.fir_params in
+  let is_tail_call = function
+    | Call (rd, name, args) :: Ret (Some (VReg result)) :: _
+      when name = f.fir_name && rd = result &&
+           List.length args = param_count -> true
+    | Call (_, name, args) :: Ret None :: _
+      when name = f.fir_name && List.length args = param_count -> true
+    | _ -> false
+  in
+  let rec contains_tail_call = function
+    | [] -> false
+    | (_ :: rest as instrs) ->
+      is_tail_call instrs || contains_tail_call rest
+  in
+  if not (contains_tail_call f.fir_body) then f
+  else
+    let rec split_param_stores params body acc =
+      match params, body with
+      | [], _ -> Some (List.rev acc, body)
+      | (_, off) :: params_rest,
+        (Sw (0, actual_off, VReg _) as store) :: body_rest
+        when off = actual_off ->
+          split_param_stores params_rest body_rest (store :: acc)
+      | _ -> None
+    in
+    match split_param_stores f.fir_params f.fir_body [] with
+    | None -> f
+    | Some (prologue, body) ->
+      let entry_label = ".tailrec_" ^ f.fir_name in
+      let stores_for args =
+        List.map2 (fun (_, off) arg -> Sw (0, off, arg)) f.fir_params args
+      in
+      let rec rewrite = function
+        | Call (rd, name, args) :: Ret (Some (VReg result)) :: rest
+          when name = f.fir_name && rd = result &&
+               List.length args = param_count ->
+            stores_for args @ Jmp entry_label :: rewrite rest
+        | Call (_, name, args) :: Ret None :: rest
+          when name = f.fir_name && List.length args = param_count ->
+            stores_for args @ Jmp entry_label :: rewrite rest
+        | instr :: rest -> instr :: rewrite rest
+        | [] -> []
+      in
+      { f with fir_body = prologue @ Label entry_label :: rewrite body }
 
-(* collect vregs defined in an instruction list *)
-let collect_defs (instrs : instr list) : ISet.t =
-  let s = ref ISet.empty in
-  List.iter (fun i ->
-    match def_vreg i with Some r -> s := ISet.add r !s | None -> ()
-  ) instrs;
-  !s
+let starts_with prefix s =
+  let prefix_len = String.length prefix in
+  String.length s >= prefix_len &&
+  String.sub s 0 prefix_len = prefix
 
-let unroll_func (f : func_ir) : func_ir =
-  let arr, bbs = build_cfg f.fir_body in
-  let nbb = Array.length bbs in
-  let loops = ref [] in
-  for bid = 0 to nbb - 1 do
-    List.iter (fun succ ->
-      if succ <= bid then loops := (bid, succ) :: !loops
-    ) bbs.(bid).b_succs
-  done;
-  if !loops = [] then f
-  else begin
-    let max_vreg = find_max_vreg f.fir_body in
-    let next_vreg = ref (max_vreg + 1) in
-    let insert = Array.make (Array.length arr) [] in
-    let remove = Array.make (Array.length arr) false in
+let is_while_header label =
+  starts_with ".while" label && not (starts_with ".while_end" label)
 
-    List.iter (fun (tail, header) ->
-      let hstart = bbs.(header).b_start in
-      let hend = bbs.(header).b_end in
-      let tstart = bbs.(tail).b_start in
-      let tend = bbs.(tail).b_end in
+let is_while_end label =
+  starts_with ".while_end" label
 
-      let has_nested = ref false in
-      for j = hend + 1 to tend - 1 do
-        match arr.(j) with
-        | Bz _ | Bnz _ -> has_nested := true
-        | _ -> ()
-      done;
-      if !has_nested then () else begin
+let take n xs =
+  let rec loop left acc = function
+    | _ when left = 0 -> List.rev acc
+    | [] -> List.rev acc
+    | x :: rest -> loop (left - 1) (x :: acc) rest
+  in
+  loop n [] xs
 
-      let body_instrs = ref [] in
-      for j = hstart to hend do body_instrs := arr.(j) :: !body_instrs done;
-      for j = tstart to tend do body_instrs := arr.(j) :: !body_instrs done;
-      let body_instrs = List.rev !body_instrs in
-
-      let body_defs = collect_defs body_instrs in
-
-      let trip_opt = ref None in
-      for j = hstart to hend do
-        match arr.(j) with
-        | Li (_, n) when n > 0 && n <= 4 ->
-          trip_opt := Some n
-        | _ -> ()
-      done;
-
-      match !trip_opt with
-      | Some k when k <= 2 ->
-        let tail_body = ref [] in
-        for j = tstart to tend do tail_body := arr.(j) :: !tail_body done;
-        let tail_body = List.rev !tail_body in
-        let body_only = List.filter (fun i ->
-          match i with Label _ | Bz _ | Bnz _ | Jmp _ -> false | _ -> true
-        ) tail_body in
-
-        let copies = ref [] in
-        for _ = 1 to k do
-          copies := (List.rev body_only) :: !copies
-        done;
-        for j = hstart to tend do remove.(j) <- true done;
-        if hstart > 0 then
-          insert.(hstart - 1) <- (List.flatten !copies |> List.rev) @ insert.(hstart - 1)
-
-      | _ ->
-        let body_tail = ref [] in
-        for j = tstart to tend do body_tail := arr.(j) :: !body_tail done;
-        let body_tail = List.rev !body_tail in
-        let body_no_jmp = List.filter (function Jmp _ -> false | _ -> true) body_tail in
-        let body_sz = List.length body_no_jmp in
-        if body_sz >= 5 then begin
-          let rmap = ref IMap.empty in
-          ISet.iter (fun r ->
-            let fresh = !next_vreg in
-            incr next_vreg;
-            rmap := IMap.add r fresh !rmap
-          ) body_defs;
-          let copy = List.map (rename_instr !rmap) body_no_jmp in
-          insert.(tend - 1) <- (List.rev copy) @ insert.(tend - 1)
-        end
-      end
-    ) !loops;
-
-    let result = ref [] in
-    for i = Array.length arr - 1 downto 0 do
-      if not remove.(i) then begin
-        List.iter (fun instr -> result := instr :: !result) insert.(i);
-        result := arr.(i) :: !result
-      end
+(* Tail-recursive parameter slots are private to the current frame.  Cache the
+   frequently read ones after the initial parameter stores; tail backedges
+   update the cache directly and skip the one-time loads. *)
+let cache_tailrec_params (f : func_ir) : func_ir =
+  let entry_label = ".tailrec_" ^ f.fir_name in
+  let arr = Array.of_list f.fir_body in
+  let entry_idx = ref None in
+  Array.iteri (fun idx -> function
+    | Label label when label = entry_label -> entry_idx := Some idx
+    | _ -> ()
+  ) arr;
+  match !entry_idx with
+  | None -> f
+  | Some label_idx ->
+    let param_offsets =
+      List.fold_left (fun offsets (_, off) -> off :: offsets)
+        [] f.fir_params
+    in
+    let read_counts = Hashtbl.create (List.length param_offsets) in
+    for idx = label_idx + 1 to Array.length arr - 1 do
+      match arr.(idx) with
+      | Lw (_, 0, off) when List.mem off param_offsets ->
+        let old =
+          match Hashtbl.find_opt read_counts off with
+          | Some count -> count
+          | None -> 0
+        in
+        Hashtbl.replace read_counts off (old + 1)
+      | _ -> ()
     done;
-    { f with fir_body = !result }
-  end
+    let selected_offsets =
+      Hashtbl.to_seq read_counts
+      |> List.of_seq
+      |> List.sort (fun (off1, count1) (off2, count2) ->
+           let by_count = compare count2 count1 in
+           if by_count <> 0 then by_count else compare off1 off2)
+      |> take 8
+      |> List.map fst
+    in
+    if selected_offsets = [] then f
+    else
+      let next_vreg = ref (find_max_vreg f.fir_body + 1) in
+      let cache_for_slot = Hashtbl.create (List.length selected_offsets) in
+      List.iter (fun off ->
+        Hashtbl.add cache_for_slot off !next_vreg;
+        incr next_vreg
+      ) selected_offsets;
+      let loads =
+        List.map (fun off ->
+          Lw (Hashtbl.find cache_for_slot off, 0, off)
+        ) selected_offsets
+      in
+      let result = ref [] in
+      Array.iteri (fun idx instr ->
+        if idx = label_idx then
+          List.iter (fun load -> result := load :: !result) loads;
+        let rewritten =
+          if idx <= label_idx then instr
+          else
+            match instr with
+            | Lw (rd, 0, off) when Hashtbl.mem cache_for_slot off ->
+              Mov (rd, VReg (Hashtbl.find cache_for_slot off))
+            | Sw (0, off, value) when Hashtbl.mem cache_for_slot off ->
+              Mov (Hashtbl.find cache_for_slot off, value)
+            | _ -> instr
+        in
+        result := rewritten :: !result
+      ) arr;
+      { f with fir_body = List.rev !result }
+
+(* Keep frequently accessed local stack slots in virtual registers inside
+   innermost structured while loops.  The original control flow is unchanged:
+   slots are loaded before the header and flushed immediately after the exit
+   label, which also covers break edges. *)
+let cache_loop_slots (f : func_ir) : func_ir =
+  let arr = Array.of_list f.fir_body in
+  let n = Array.length arr in
+  if n = 0 then f
+  else
+    let label_pos = Hashtbl.create 32 in
+    Array.iteri (fun idx -> function
+      | Label label -> Hashtbl.replace label_pos label idx
+      | _ -> ()
+    ) arr;
+    let loops = ref [] in
+    Array.iteri (fun header_idx -> function
+      | Label header_label when is_while_header header_label ->
+        let exit_idx = ref None in
+        let cursor = ref (header_idx + 1) in
+        while !cursor < n && !exit_idx = None do
+          (match arr.(!cursor) with
+           | Bz (_, exit_label) when is_while_end exit_label ->
+             (match Hashtbl.find_opt label_pos exit_label with
+              | Some idx when idx > !cursor -> exit_idx := Some idx
+              | _ -> ())
+           | _ -> ());
+          incr cursor
+        done;
+        (match !exit_idx with
+         | Some idx -> loops := (header_idx, idx) :: !loops
+         | None -> ())
+      | _ -> ()
+    ) arr;
+    let loops = !loops in
+    let has_only_local_edges (header_idx, exit_idx) =
+      let target_is_local label =
+        match Hashtbl.find_opt label_pos label with
+        | Some idx -> idx >= header_idx && idx <= exit_idx
+        | None -> false
+      in
+      let local = ref true in
+      for idx = header_idx + 1 to exit_idx - 1 do
+        match arr.(idx) with
+        | Jmp label | Bz (_, label) | Bnz (_, label) ->
+          if not (target_is_local label) then local := false
+        | _ -> ()
+      done;
+      !local
+    in
+    let innermost_loops =
+      List.filter (fun (header_idx, exit_idx) ->
+        has_only_local_edges (header_idx, exit_idx) &&
+        not (List.exists (fun (inner_header, inner_exit) ->
+          header_idx < inner_header && inner_exit < exit_idx
+        ) loops)
+      ) loops
+    in
+    if innermost_loops = [] then f
+    else
+      let next_vreg = ref (find_max_vreg f.fir_body + 1) in
+      let rewritten = Array.copy arr in
+      let before = Array.make n [] in
+      let after = Array.make n [] in
+      List.iter (fun (header_idx, exit_idx) ->
+        let access_counts = Hashtbl.create 16 in
+        let note off is_read =
+          let reads, total =
+            match Hashtbl.find_opt access_counts off with
+            | Some counts -> counts
+            | None -> (0, 0)
+          in
+          Hashtbl.replace access_counts off
+            (reads + (if is_read then 1 else 0), total + 1)
+        in
+        for idx = header_idx + 1 to exit_idx - 1 do
+          match arr.(idx) with
+          | Lw (_, 0, off) -> note off true
+          | Sw (0, off, _) -> note off false
+          | _ -> ()
+        done;
+        let selected_slots =
+          Hashtbl.to_seq access_counts
+          |> List.of_seq
+          |> List.filter (fun (_, (reads, _)) -> reads > 0)
+          |> List.sort (fun (off1, (_, total1)) (off2, (_, total2)) ->
+               let by_count = compare total2 total1 in
+               if by_count <> 0 then by_count else compare off1 off2)
+          |> take 8
+        in
+        let cache_for_slot = Hashtbl.create (List.length selected_slots) in
+        List.iter (fun (off, _) ->
+          let cache = !next_vreg in
+          incr next_vreg;
+          Hashtbl.add cache_for_slot off cache
+        ) selected_slots;
+        let loads =
+          List.map (fun (off, _) ->
+            Lw (Hashtbl.find cache_for_slot off, 0, off)
+          ) selected_slots
+        in
+        let stores =
+          List.map (fun (off, _) ->
+            Sw (0, off, VReg (Hashtbl.find cache_for_slot off))
+          ) selected_slots
+        in
+        before.(header_idx) <- loads @ before.(header_idx);
+        after.(exit_idx) <- stores @ after.(exit_idx);
+        for idx = header_idx + 1 to exit_idx - 1 do
+          rewritten.(idx) <-
+            match rewritten.(idx) with
+            | Lw (rd, 0, off) when Hashtbl.mem cache_for_slot off ->
+              Mov (rd, VReg (Hashtbl.find cache_for_slot off))
+            | Sw (0, off, value) when Hashtbl.mem cache_for_slot off ->
+              Mov (Hashtbl.find cache_for_slot off, value)
+            | instr -> instr
+        done
+      ) innermost_loops;
+      let result = ref [] in
+      let append instrs =
+        List.iter (fun instr -> result := instr :: !result) instrs
+      in
+      for idx = 0 to n - 1 do
+        append before.(idx);
+        result := rewritten.(idx) :: !result;
+        append after.(idx)
+      done;
+      { f with fir_body = List.rev !result }
 
 (* --- Driver for the local passes --- *)
 
@@ -472,6 +600,7 @@ let optimize_func_body (body : instr list) : instr list =
         |> alg_simplify
         |> copy_prop
         |> strength_reduce
+        |> dead_store_elim
         |> dead_code_elim
         |> peephole
         |> remove_dead_after_jmp
@@ -525,8 +654,12 @@ let cse_func (f : func_ir) : func_ir =
          | Some r -> Mov (rd, VReg r)
          | None   -> Hashtbl.replace tbl key rd; instr)
       | Sw (0, off, _) ->
-        invalidate_lw off; instr
-      | Call _ | Jmp _ | Label _ ->
+        invalidate_lw off;
+        (match instr with
+         | Sw (_, _, VReg r) -> Hashtbl.replace tbl (KLw off) r
+         | _ -> ());
+        instr
+      | Call _ | Jmp _ | Bz _ | Bnz _ | Ret _ | Label _ ->
         Hashtbl.reset tbl; instr
       | _ -> instr
     ) f.fir_body
@@ -545,13 +678,19 @@ let dce (f : func_ir) : func_ir =
 (* --- Combined optimize_func: run CSE -> local passes -> iterative DCE until convergence --- *)
 
 let optimize_func (f : func_ir) : func_ir =
-  let rec loop f =
+  let rec loop iter f =
+    if iter >= max_iterations then f
+    else
     let f1 = cse_func f in
     let f2 = { f1 with fir_body = optimize_func_body f1.fir_body } in
     let f3 = dce f2 in
-    if List.length f3.fir_body = List.length f.fir_body then f3 else loop f3
+    if f3.fir_body = f.fir_body then f3 else loop (iter + 1) f3
   in
-  loop (unroll_func f)
+  f
+  |> tail_rec_elim
+  |> loop 0
+  |> cache_tailrec_params
+  |> cache_loop_slots
 
 let optimize_module (m : module_ir) : module_ir =
   { m with mir_functions = List.map optimize_func m.mir_functions }
