@@ -47,6 +47,12 @@ let log2_power_of_two n =
   in
   loop 0 n
 
+let signed_power_of_two_magnitude n =
+  let magnitude = if n < 0 then -n else n in
+  if magnitude > 1 && is_positive_power_of_two magnitude then
+    Some magnitude
+  else None
+
 let is_compare = function
   | Eq | Neq | Lt | Gt | Le | Ge -> true
   | Add | Sub | Mul | Div | Mod | And | Or -> false
@@ -91,6 +97,40 @@ let emit_one buf spill_base reg_map = function
     Buffer.add_string buf load;
     Buffer.add_string buf
       (Printf.sprintf "  addi %s, %s, %d\n" dst src (-n));
+    Buffer.add_string buf store
+  | Binop (rd, ((Div | Mod) as op), v, VImm divisor)
+    when signed_power_of_two_magnitude divisor <> None ->
+    let magnitude = Option.get (signed_power_of_two_magnitude divisor) in
+    let shift = log2_power_of_two magnitude in
+    let (src, load) = resolve_src reg_map spill_base spill_temp1 v in
+    let (dst, store) = resolve_dst reg_map spill_base spill_temp1 rd in
+    Buffer.add_string buf load;
+    (* Signed division rounds toward zero, so negative dividends receive a
+       2^k-1 bias before the arithmetic shift.  The same bias gives C's
+       signed remainder after masking. *)
+    Buffer.add_string buf
+      (Printf.sprintf "  srai %s, %s, 31\n  srli %s, %s, %d\n"
+         spill_temp2 src spill_temp2 spill_temp2 (32 - shift));
+    Buffer.add_string buf
+      (Printf.sprintf "  add %s, %s, %s\n" dst src spill_temp2);
+    (match op with
+     | Div ->
+       Buffer.add_string buf
+         (Printf.sprintf "  srai %s, %s, %d\n" dst dst shift);
+       if divisor < 0 then
+         Buffer.add_string buf (Printf.sprintf "  neg %s, %s\n" dst dst)
+     | Mod ->
+       let mask = magnitude - 1 in
+       if fits_imm12 mask then
+         Buffer.add_string buf
+           (Printf.sprintf "  andi %s, %s, %d\n" dst dst mask)
+       else
+         Buffer.add_string buf
+           (Printf.sprintf "  slli %s, %s, %d\n  srli %s, %s, %d\n"
+              dst dst (32 - shift) dst dst (32 - shift));
+       Buffer.add_string buf
+         (Printf.sprintf "  sub %s, %s, %s\n" dst dst spill_temp2)
+     | _ -> assert false);
     Buffer.add_string buf store
   | Binop (rd, Mul, v, VImm n) when is_positive_power_of_two n ->
     let (src, load) = resolve_src reg_map spill_base spill_temp1 v in
@@ -298,7 +338,8 @@ let emit_one buf spill_base reg_map = function
     ) args;
     Buffer.add_string buf (Printf.sprintf "  jal ra, %s\n" fname);
     let (dst, st) = resolve_dst reg_map call_spill_base spill_temp1 rd in
-    Buffer.add_string buf (Printf.sprintf "  mv %s, a0\n" dst);
+    if dst <> "a0" then
+      Buffer.add_string buf (Printf.sprintf "  mv %s, a0\n" dst);
     Buffer.add_string buf st;
     if adj > 0 then
       Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" adj)
@@ -316,12 +357,27 @@ let emit_one buf spill_base reg_map = function
   | Label name ->
     Buffer.add_string buf (Printf.sprintf "%s:\n" name)
 
-let emit_func buf f (fa : func_alloc) =
-  let stack_sz = f.fir_stack_sz in
+let effective_stack_size body =
+  List.fold_left (fun size -> function
+    | Lw (_, 0, off) | Sw (0, off, _) -> max size (off + 4)
+    | _ -> size
+  ) 0 body
+
+let emit_func buf (f : func_ir) (fa : func_alloc) =
+  (* IR generation reserves a slot for every source local.  After promotion,
+     forwarding and inlining, many of those slots no longer occur in the IR.
+     Recompute the actually-addressed prefix so dead locals do not force a
+     frame in otherwise register-only leaf functions. *)
+  let stack_sz = effective_stack_size f.fir_body in
   let spill_sz = fa.fa_spill_sz in
   let callee_count = List.length fa.fa_callee_used in
-  let total_frame = align16 (stack_sz + spill_sz + callee_count * 4 + 4) in
-  let ra_off = total_frame - 4 in
+  let has_call =
+    List.exists (function Ir.Call _ -> true | _ -> false) f.fir_body
+  in
+  let save_ra = f.fir_name <> "main" && has_call in
+  let ra_off = stack_sz + spill_sz + callee_count * 4 in
+  let frame_bytes = ra_off + (if save_ra then 4 else 0) in
+  let total_frame = align16 frame_bytes in
   let spill_base = stack_sz in
 
   let ret_label = "." ^ f.fir_name ^ "_ret" in
@@ -329,8 +385,10 @@ let emit_func buf f (fa : func_alloc) =
   if f.fir_name = "main" then
     Buffer.add_string buf (Printf.sprintf "\n  .globl %s\n" f.fir_name);
   Buffer.add_string buf (Printf.sprintf "%s:\n" f.fir_name);
-  Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" (-total_frame));
-  Buffer.add_string buf (Printf.sprintf "  sw ra, %d(sp)\n" ra_off);
+  if total_frame > 0 then
+    Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" (-total_frame));
+  if save_ra then
+    Buffer.add_string buf (Printf.sprintf "  sw ra, %d(sp)\n" ra_off);
 
   List.iteri (fun i reg ->
     let off = stack_sz + spill_sz + i * 4 in
@@ -344,7 +402,8 @@ let emit_func buf f (fa : func_alloc) =
       let areg = "a" ^ string_of_int i in
       match Hashtbl.find_opt fa.fa_reg_map vreg with
       | Some (Reg r) ->
-        Buffer.add_string buf (Printf.sprintf "  mv %s, %s\n" r areg)
+        if r <> areg then
+          Buffer.add_string buf (Printf.sprintf "  mv %s, %s\n" r areg)
       | Some (Spill off) ->
         Buffer.add_string buf (Printf.sprintf "  sw %s, %d(sp)\n" areg (spill_base + off))
       | None -> ()
@@ -398,6 +457,13 @@ let emit_func buf f (fa : func_alloc) =
       when rd = branch_r && used_once rd ->
       emit_one buf spill_base fa.fa_reg_map (Bz (v, label));
       emit_body rest
+    | Ret (Some v) :: [] ->
+      let (rv, lv) = resolve_src fa.fa_reg_map spill_base "a0" v in
+      Buffer.add_string buf lv;
+      if rv <> "a0" then
+        Buffer.add_string buf (Printf.sprintf "  mv a0, %s\n" rv)
+    | Ret None :: [] ->
+      ()
     | Ret (Some v) :: rest ->
       let (rv, lv) = resolve_src fa.fa_reg_map spill_base "a0" v in
       Buffer.add_string buf lv;
@@ -421,8 +487,8 @@ let emit_func buf f (fa : func_alloc) =
       let off = stack_sz + spill_sz + i * 4 in
       Buffer.add_string buf (Printf.sprintf "  lw %s, %d(sp)\n" reg off)
     ) fa.fa_callee_used;
-    Buffer.add_string buf (Printf.sprintf "  lw ra, %d(sp)\n" ra_off);
-    Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" total_frame);
+    if total_frame > 0 then
+      Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" total_frame);
     Buffer.add_string buf "  li a7, 93\n";
     Buffer.add_string buf "  ecall\n"
   end else begin
@@ -430,8 +496,10 @@ let emit_func buf f (fa : func_alloc) =
       let off = stack_sz + spill_sz + i * 4 in
       Buffer.add_string buf (Printf.sprintf "  lw %s, %d(sp)\n" reg off)
     ) fa.fa_callee_used;
-    Buffer.add_string buf (Printf.sprintf "  lw ra, %d(sp)\n" ra_off);
-    Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" total_frame);
+    if save_ra then
+      Buffer.add_string buf (Printf.sprintf "  lw ra, %d(sp)\n" ra_off);
+    if total_frame > 0 then
+      Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" total_frame);
     Buffer.add_string buf "  ret\n"
   end
 
