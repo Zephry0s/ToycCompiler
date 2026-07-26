@@ -53,6 +53,69 @@ let signed_power_of_two_magnitude n =
     Some magnitude
   else None
 
+type multiply_shape =
+  | ShiftOnly of int
+  | ShiftAdd of int
+  | ShiftSub of int
+
+let cheap_multiply_shape n =
+  let n = normalize_i32 n in
+  let magnitude = if n < 0 then -n else n in
+  if magnitude <= 1 then None
+  else if is_positive_power_of_two magnitude then
+    Some (ShiftOnly (log2_power_of_two magnitude), n < 0)
+  else if is_positive_power_of_two (magnitude - 1) then
+    Some (ShiftAdd (log2_power_of_two (magnitude - 1)), n < 0)
+  else if is_positive_power_of_two (magnitude + 1) then
+    Some (ShiftSub (log2_power_of_two (magnitude + 1)), n < 0)
+  else None
+
+(* Compute the multiplier and post-shift for exact signed division by a
+   non-power-of-two constant.  This is the 32-bit form of the algorithm used
+   by LLVM's SignedDivisionByConstantInfo (Hacker's Delight, chapter 10). *)
+let signed_division_magic divisor =
+  let divisor = normalize_i32 divisor in
+  let d = Int64.of_int divisor in
+  let ad = Int64.abs d in
+  let two31 = Int64.shift_left 1L 31 in
+  let t = Int64.add two31 (if divisor < 0 then 1L else 0L) in
+  let anc = Int64.sub (Int64.sub t 1L) (Int64.rem t ad) in
+  let p = ref 31 in
+  let q1 = ref (Int64.div two31 anc) in
+  let r1 = ref (Int64.sub two31 (Int64.mul !q1 anc)) in
+  let q2 = ref (Int64.div two31 ad) in
+  let r2 = ref (Int64.sub two31 (Int64.mul !q2 ad)) in
+  let delta = ref 0L in
+  let continue = ref true in
+  while !continue do
+    incr p;
+    q1 := Int64.mul !q1 2L;
+    r1 := Int64.mul !r1 2L;
+    if Int64.compare !r1 anc >= 0 then begin
+      q1 := Int64.add !q1 1L;
+      r1 := Int64.sub !r1 anc
+    end;
+    q2 := Int64.mul !q2 2L;
+    r2 := Int64.mul !r2 2L;
+    if Int64.compare !r2 ad >= 0 then begin
+      q2 := Int64.add !q2 1L;
+      r2 := Int64.sub !r2 ad
+    end;
+    delta := Int64.sub ad !r2;
+    continue :=
+      Int64.compare !q1 !delta < 0 ||
+      (Int64.compare !q1 !delta = 0 && !r1 = 0L)
+  done;
+  let magic = Int64.add !q2 1L in
+  let magic = if divisor < 0 then Int64.neg magic else magic in
+  let low32 = Int64.logand magic 0xffff_ffffL in
+  let signed_magic =
+    if Int64.compare low32 two31 >= 0 then
+      Int64.sub low32 0x1_0000_0000L
+    else low32
+  in
+  (Int64.to_int signed_magic, !p - 32)
+
 let is_compare = function
   | Eq | Neq | Lt | Gt | Le | Ge -> true
   | Add | Sub | Mul | Div | Mod | And | Or -> false
@@ -74,6 +137,27 @@ let emit_compare_branch buf spill_base reg_map branch_if_true op v1 v2 label =
   Buffer.add_string buf l2;
   Buffer.add_string buf
     (Printf.sprintf "  %s %s, %s, %s\n" mnemonic lhs rhs label)
+
+let emit_cheap_multiply buf spill_base reg_map rd value constant =
+  let shape, negate = Option.get (cheap_multiply_shape constant) in
+  let (src, load) = resolve_src reg_map spill_base spill_temp1 value in
+  let (dst, store) = resolve_dst reg_map spill_base spill_temp1 rd in
+  Buffer.add_string buf load;
+  (match shape with
+   | ShiftOnly shift ->
+     Buffer.add_string buf
+       (Printf.sprintf "  slli %s, %s, %d\n" dst src shift)
+   | ShiftAdd shift ->
+     Buffer.add_string buf
+       (Printf.sprintf "  slli %s, %s, %d\n  add %s, %s, %s\n"
+          spill_temp2 src shift dst spill_temp2 src)
+   | ShiftSub shift ->
+     Buffer.add_string buf
+       (Printf.sprintf "  slli %s, %s, %d\n  sub %s, %s, %s\n"
+          spill_temp2 src shift dst spill_temp2 src));
+  if negate then
+    Buffer.add_string buf (Printf.sprintf "  neg %s, %s\n" dst dst);
+  Buffer.add_string buf store
 
 let emit_one buf spill_base reg_map = function
   | Binop (rd, Add, v, VImm n) when fits_imm12 n ->
@@ -132,6 +216,67 @@ let emit_one buf spill_base reg_map = function
          (Printf.sprintf "  sub %s, %s, %s\n" dst dst spill_temp2)
      | _ -> assert false);
     Buffer.add_string buf store
+  | Binop (rd, ((Div | Mod) as op), v, VImm raw_divisor)
+    when
+      let divisor = normalize_i32 raw_divisor in
+      divisor <> 0 && divisor <> 1 && divisor <> -1 &&
+      signed_power_of_two_magnitude divisor = None ->
+    let divisor = normalize_i32 raw_divisor in
+    let magic, shift = signed_division_magic divisor in
+    let (src, load) = resolve_src reg_map spill_base spill_temp1 v in
+    let (dst, store) = resolve_dst reg_map spill_base spill_temp1 rd in
+    Buffer.add_string buf load;
+    let original, reload_original =
+      if op = Mod && src = dst then
+        if load = "" then begin
+          Buffer.add_string buf
+            (Printf.sprintf "  mv %s, %s\n" spill_temp1 src);
+          (spill_temp1, "")
+        end else
+          (src, load)
+      else
+        (src, "")
+    in
+    (* [mulh x, y, x] is legal: both inputs are consumed before x is
+       overwritten, so t6 can hold the magic constant and then the quotient. *)
+    Buffer.add_string buf
+      (Printf.sprintf "  li %s, %d\n  mulh %s, %s, %s\n"
+         spill_temp2 magic spill_temp2 src spill_temp2);
+    if divisor > 0 && magic < 0 then
+      Buffer.add_string buf
+        (Printf.sprintf "  add %s, %s, %s\n"
+           spill_temp2 spill_temp2 src)
+    else if divisor < 0 && magic > 0 then
+      Buffer.add_string buf
+        (Printf.sprintf "  sub %s, %s, %s\n"
+           spill_temp2 spill_temp2 src);
+    if shift > 0 then
+      Buffer.add_string buf
+        (Printf.sprintf "  srai %s, %s, %d\n"
+           spill_temp2 spill_temp2 shift);
+    Buffer.add_string buf
+      (Printf.sprintf "  srli %s, %s, 31\n  add %s, %s, %s\n"
+         dst spill_temp2 spill_temp2 spill_temp2 dst);
+    (match op with
+     | Div ->
+       if dst <> spill_temp2 then
+         Buffer.add_string buf
+           (Printf.sprintf "  mv %s, %s\n" dst spill_temp2)
+     | Mod ->
+       Buffer.add_string buf
+         (Printf.sprintf "  li %s, %d\n  mul %s, %s, %s\n"
+            dst divisor spill_temp2 spill_temp2 dst);
+       Buffer.add_string buf reload_original;
+       Buffer.add_string buf
+         (Printf.sprintf "  sub %s, %s, %s\n" dst original spill_temp2)
+     | _ -> assert false);
+    Buffer.add_string buf store
+  | Binop (rd, Mul, value, VImm constant)
+    when cheap_multiply_shape constant <> None ->
+    emit_cheap_multiply buf spill_base reg_map rd value constant
+  | Binop (rd, Mul, VImm constant, value)
+    when cheap_multiply_shape constant <> None ->
+    emit_cheap_multiply buf spill_base reg_map rd value constant
   | Binop (rd, Mul, v, VImm n) when is_positive_power_of_two n ->
     let (src, load) = resolve_src reg_map spill_base spill_temp1 v in
     let (dst, store) = resolve_dst reg_map spill_base spill_temp1 rd in
@@ -370,7 +515,12 @@ let emit_func buf (f : func_ir) (fa : func_alloc) =
      frame in otherwise register-only leaf functions. *)
   let stack_sz = effective_stack_size f.fir_body in
   let spill_sz = fa.fa_spill_sz in
-  let callee_count = List.length fa.fa_callee_used in
+  (* main terminates via ecall and never returns to an ABI caller, so saving
+     its s-register colors only adds entry/exit memory traffic. *)
+  let saved_callee =
+    if f.fir_name = "main" then [] else fa.fa_callee_used
+  in
+  let callee_count = List.length saved_callee in
   let has_call =
     List.exists (function Ir.Call _ -> true | _ -> false) f.fir_body
   in
@@ -393,7 +543,7 @@ let emit_func buf (f : func_ir) (fa : func_alloc) =
   List.iteri (fun i reg ->
     let off = stack_sz + spill_sz + i * 4 in
     Buffer.add_string buf (Printf.sprintf "  sw %s, %d(sp)\n" reg off)
-  ) fa.fa_callee_used;
+  ) saved_callee;
 
   let n_params = List.length f.fir_params in
   for i = 0 to n_params - 1 do
@@ -486,7 +636,7 @@ let emit_func buf (f : func_ir) (fa : func_alloc) =
     List.iteri (fun i reg ->
       let off = stack_sz + spill_sz + i * 4 in
       Buffer.add_string buf (Printf.sprintf "  lw %s, %d(sp)\n" reg off)
-    ) fa.fa_callee_used;
+    ) saved_callee;
     if total_frame > 0 then
       Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" total_frame);
     Buffer.add_string buf "  li a7, 93\n";
@@ -495,7 +645,7 @@ let emit_func buf (f : func_ir) (fa : func_alloc) =
     List.iteri (fun i reg ->
       let off = stack_sz + spill_sz + i * 4 in
       Buffer.add_string buf (Printf.sprintf "  lw %s, %d(sp)\n" reg off)
-    ) fa.fa_callee_used;
+    ) saved_callee;
     if save_ra then
       Buffer.add_string buf (Printf.sprintf "  lw ra, %d(sp)\n" ra_off);
     if total_frame > 0 then
