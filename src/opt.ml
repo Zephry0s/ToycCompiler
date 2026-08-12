@@ -1178,11 +1178,12 @@ let materialize_loop_constants (f : func_ir) : func_ir =
         else
           match op, side with
           | (Div | Mod), `Left -> true
-          (* Keep an immediate divisor visible to codegen: powers of two use
-             shifts and all other constants use a magic multiply-high
-             sequence.  Turning it into a vreg here would force a hardware
-             div/rem in the hot loop. *)
-          | (Div | Mod), `Right -> false
+          (* RV32IM has native div/rem.  Materializing a non-power-of-two
+             divisor once in the preheader is substantially cheaper than
+             rebuilding a long magic-number sequence on every iteration.
+             Power-of-two divisors keep their immediate form so codegen can
+             still select its short signed shift/mask sequence. *)
+          | (Div | Mod), `Right -> not (signed_power_of_two value)
           | Mul, _ -> not (cheap_multiply_constant value)
           | Add, _ -> not (fits_i12 value)
           | Sub, `Left -> true
@@ -2041,6 +2042,131 @@ let promote_local_slots (f : func_ir) : func_ir =
     in
     { f with fir_body = promoted }
 
+(* Replace a loop-varying multiply of a unit-step induction variable by an
+   add recurrence.  For example, [row * width] becomes a preheader seed and
+   [scaled += width] beside [row += 1].  Arithmetic is modulo 2^32 in both
+   forms, so the transformation preserves ToyC integer overflow semantics.
+
+   The pass runs after slot promotion and move folding, where an induction
+   update has the compact mutable-vreg form [%i = add %i, +/-1].  It accepts
+   nested control flow because the scaled update is placed immediately after
+   the unique induction update; break/continue paths that skip one also skip
+   the other. *)
+let reduce_induction_multiplication (f : func_ir) : func_ir =
+  let cfg = build_cfg f.fir_body in
+  let n = Array.length cfg.cfg_instrs in
+  if n = 0 then f
+  else begin
+    let rewritten = Array.copy cfg.cfg_instrs in
+    let before = Array.make n [] in
+    let after = Array.make n [] in
+    let next_vreg = ref (find_max_vreg f.fir_body + 1) in
+    let claimed_products = ref IntSet.empty in
+    let backedges =
+      Array.fold_left (fun edges block ->
+        List.fold_left (fun edges successor ->
+          if successor <= block.cb_id then
+            (successor, block.cb_id) :: edges
+          else edges
+        ) edges block.cb_succs
+      ) [] cfg.cfg_blocks
+      |> List.sort (fun (header1, latch1) (header2, latch2) ->
+           compare (latch1 - header1) (latch2 - header2))
+    in
+    List.iter (fun (header_id, latch_id) ->
+      let first = cfg.cfg_blocks.(header_id).cb_start in
+      let last = cfg.cfg_blocks.(latch_id).cb_end in
+      let definitions = Hashtbl.create 32 in
+      let note_definition reg =
+        let count =
+          match Hashtbl.find_opt definitions reg with
+          | Some old -> old
+          | None -> 0
+        in
+        Hashtbl.replace definitions reg (count + 1)
+      in
+      for idx = first to last do
+        Option.iter note_definition (def_vreg rewritten.(idx))
+      done;
+      let defined_once reg = Hashtbl.find_opt definitions reg = Some 1 in
+      let invariant = function
+        | VImm value -> not (cheap_multiply_constant value)
+        | VReg reg -> reg <> 0 && not (Hashtbl.mem definitions reg)
+      in
+      let updates = ref [] in
+      for idx = first to last do
+        match rewritten.(idx) with
+        | Binop (rd, Add, VReg source, VImm step)
+          when rd = source && (step = 1 || step = -1) && defined_once rd ->
+          updates := (rd, idx, step) :: !updates
+        | Binop (rd, Add, VImm step, VReg source)
+          when rd = source && (step = 1 || step = -1) && defined_once rd ->
+          updates := (rd, idx, step) :: !updates
+        | Binop (temporary, Add, VReg induction, VImm step)
+          when (step = 1 || step = -1) && idx + 1 <= last &&
+               defined_once induction && defined_once temporary ->
+          (match rewritten.(idx + 1) with
+           | Mov (destination, VReg source)
+             when destination = induction && source = temporary ->
+             updates := (induction, idx + 1, step) :: !updates
+           | _ -> ())
+        | Binop (temporary, Add, VImm step, VReg induction)
+          when (step = 1 || step = -1) && idx + 1 <= last &&
+               defined_once induction && defined_once temporary ->
+          (match rewritten.(idx + 1) with
+           | Mov (destination, VReg source)
+             when destination = induction && source = temporary ->
+             updates := (induction, idx + 1, step) :: !updates
+           | _ -> ())
+        | _ -> ()
+      done;
+      List.iter (fun (induction, update_idx, step) ->
+        let products = Hashtbl.create 8 in
+        let note_product idx rd multiplier =
+          if idx < update_idx && invariant multiplier &&
+             not (IntSet.mem idx !claimed_products) then begin
+            let old =
+              match Hashtbl.find_opt products multiplier with
+              | Some entries -> entries
+              | None -> []
+            in
+            Hashtbl.replace products multiplier ((idx, rd) :: old)
+          end
+        in
+        for idx = first to update_idx - 1 do
+          match rewritten.(idx) with
+          | Binop (rd, Mul, VReg reg, multiplier) when reg = induction ->
+            note_product idx rd multiplier
+          | Binop (rd, Mul, multiplier, VReg reg) when reg = induction ->
+            note_product idx rd multiplier
+          | _ -> ()
+        done;
+        Hashtbl.iter (fun multiplier entries ->
+          let cache = !next_vreg in
+          incr next_vreg;
+          before.(first) <- before.(first) @
+            [Binop (cache, Mul, VReg induction, multiplier)];
+          List.iter (fun (idx, rd) ->
+            rewritten.(idx) <- Mov (rd, VReg cache);
+            claimed_products := IntSet.add idx !claimed_products
+          ) entries;
+          let update =
+            if step = 1 then Binop (cache, Add, VReg cache, multiplier)
+            else Binop (cache, Sub, VReg cache, multiplier)
+          in
+          after.(update_idx) <- after.(update_idx) @ [update]
+        ) products
+      ) !updates
+    ) backedges;
+    let result = ref [] in
+    for idx = 0 to n - 1 do
+      List.iter (fun instr -> result := instr :: !result) before.(idx);
+      result := rewritten.(idx) :: !result;
+      List.iter (fun instr -> result := instr :: !result) after.(idx)
+    done;
+    { f with fir_body = List.rev !result }
+  end
+
 (* --- Driver for the local passes --- *)
 
 let optimize_func_body (body : instr list) : instr list =
@@ -2278,7 +2404,7 @@ let optimize_func (f : func_ir) : func_ir =
     |> materialize_backedge_branch_constants
     |> promote_local_slots
   in
-  { optimized with
+  let cleaned = { optimized with
     fir_body =
       optimized.fir_body
       |> const_fold
@@ -2290,6 +2416,18 @@ let optimize_func (f : func_ir) : func_ir =
       |> peephole
       |> remove_dead_after_jmp
       |> remove_unused_labels }
+  in
+  let reduced = reduce_induction_multiplication cleaned in
+  if reduced.fir_body = cleaned.fir_body then cleaned
+  else
+    { reduced with
+      fir_body =
+        reduced.fir_body
+        |> copy_prop
+        |> fold_defs_into_moves
+        |> dead_code_elim
+        |> peephole
+        |> remove_unused_labels }
 
 (* Inline small leaf functions.
 

@@ -17,9 +17,10 @@
 9. 循环常量寄存器化、回边边界外提与安全循环旋转；
 10. 函数级局部栈槽提升和无调用函数的热点全局量提升；
 11. 商/余数复用与单用途临时值合并；
-12. 循环深度加权的干涉图着色寄存器分配；
-13. RISC-V 立即数、移位加减、magic-number 除法和比较—分支融合；
-14. 叶函数识别、栈帧收缩和返回路径化简。
+12. 循环归纳变量乘法强度削弱；
+13. 循环深度加权的干涉图着色寄存器分配；
+14. RISC-V 立即数、移位加减、原生除模和比较—分支融合；
+15. 叶函数识别、栈帧收缩和返回路径化简。
 
 局部优化最多迭代 5 次，IR 内容不再变化时提前结束。
 
@@ -167,8 +168,8 @@ IR，也会完全展开。对于更大的循环，仅在精确次数可被 4 或
 
 RV32 的分支和部分大立即数运算需要先把常量装入寄存器。优化器最多选择
 4 个循环热点常量，在循环前生成一次 `li`，避免每次迭代重复物化。常量
-乘除模如果能由后端直接变成移位或 magic-number 序列，则保留立即数形式，
-避免过早隐藏指令选择机会。
+2 的幂除模保留立即数形式以便后端选择移位序列；其他除数在循环前物化，
+供 RV32IM 原生 `div`/`rem` 复用。
 
 对条件内部没有分支和标签、并以标准回边结束的结构化 `while`，执行循环旋转：
 
@@ -219,7 +220,26 @@ LLVM IR 需要在支配边界插入 SSA `phi`；本项目 IR 允许虚拟寄存�
 实现位置：`src/opt.ml` 中的 `promote_local_slots`、
 `propagate_readonly_globals` 和 `promote_hot_leaf_globals`。
 
-## 11. 循环加权的干涉图着色寄存器分配
+## 11. 循环归纳变量乘法强度削弱
+
+局部槽提升后，优化器会识别单位步长归纳变量 `i = i + 1`，以及循环内的
+`i * stride`。当 `stride` 在循环中不变且不能用廉价移位替代时，生成：
+
+```text
+preheader: scaled = i * stride
+loop:      使用 scaled
+           i = i + 1
+           scaled = scaled + stride
+```
+
+这样矩阵、图和线性索引循环每次迭代以一条 `add` 代替 `mul`。初始乘法位于
+原循环入口检查之后、热循环标签之前，零次循环不会额外执行；更新紧跟唯一的
+归纳变量更新，因此 `break` 和 `continue` 路径仍保持同步。两种写法都遵循
+32 位模算术，溢出语义一致。
+
+实现位置：`src/opt.ml` 中的 `reduce_induction_multiplication`。
+
+## 12. 循环加权的干涉图着色寄存器分配
 
 寄存器分配器先在 CFG 上求解块级活跃变量，再逐条指令反向扫描并建立
 虚拟寄存器干涉图。图着色使用 Chaitin 风格的简化栈：
@@ -252,7 +272,7 @@ LLVM IR 需要在支配边界插入 SSA `phi`；本项目 IR 允许虚拟寄存�
 - 活跃分析、干涉图和着色：`src/reg_alloc.ml`；
 - 调用序列生成：`src/codegen.ml`。
 
-## 12. RISC-V 强度削弱和比较—分支融合
+## 13. RISC-V 强度削弱和比较—分支融合
 
 代码生成器根据操作数选择更短、更快的指令：
 
@@ -265,8 +285,8 @@ LLVM IR 需要在支配边界插入 SSA `phi`；本项目 IR 允许虚拟寄存�
 - 有符号除以 `±2^k` 使用“符号偏置 + 算术右移”，保持向零截断；
 - 有符号模 `±2^k` 使用“符号偏置 + 掩码 + 减回偏置”，保持余数符号
   与被除数一致。
-- 其他非零常量除数使用 LLVM `SignedDivisionByConstantInfo` 同类的
-  magic-number `mulh + shift + sign adjust` 序列；
+- 其他非零常量除数使用 RV32IM 原生 `div`/`rem`；位于循环内时，除数寄存器
+  在前置块只物化一次；
 - 同一基本块中相同操作数的 `x / C` 与 `x % C` 共享商，余数改写为
   `x - (x / C) * C`。
 
@@ -281,7 +301,7 @@ LLVM IR 需要在支配边界插入 SSA `phi`；本项目 IR 允许虚拟寄存�
 
 实现位置：`src/codegen.ml` 中的 `emit_one`。
 
-## 13. 叶函数、栈帧和返回路径
+## 14. 叶函数、栈帧和返回路径
 
 代码生成前重新扫描最终 IR，只为仍被访问的局部槽保留栈空间。没有调用的
 普通函数不保存 `ra`，`main` 因最终使用 `ecall` 退出，既不保存入口 `ra`
@@ -293,7 +313,7 @@ LLVM IR 需要在支配边界插入 SSA `phi`；本项目 IR 允许虚拟寄存�
 实现位置：`src/codegen.ml` 中的 `effective_stack_size` 和 `emit_func`，以及
 `src/opt.ml` 中的 `remove_unused_labels`。
 
-## 14. 为什么新的循环展开是安全的
+## 15. 为什么新的循环展开是安全的
 
 旧实现存在两个不满足正确性的假设：
 
@@ -305,7 +325,7 @@ LLVM IR 需要在支配边界插入 SSA `phi`；本项目 IR 允许虚拟寄存�
 当前实现不再猜测迭代次数。只有第 8 节的初值、上界、步长、控制流和整除
 条件全部证明后才复制循环体；其他循环只进行语义等价的循环旋转。
 
-## 15. 回归测试与本地性能验证
+## 16. 回归测试与本地性能验证
 
 与本轮优化直接相关的测试包括：
 
@@ -329,17 +349,19 @@ LLVM IR 需要在支配边界插入 SSA `phi`；本项目 IR 允许虚拟寄存�
 - `69_bottom_up_inline_labels.tc`：多轮自底向上内联保持调用点标签唯一。
 - `70_full_unroll_dynamic.tc`：运行时数据参与的小常量次数循环完全展开；
 - `71_global_loop_promotion.tc`：只读全局传播和可变全局循环提升；
-- `72_magic_divrem.tc`：正负常量除模 magic lowering 与商复用；
+- `72_magic_divrem.tc`：正负常量除模的原生 RV32IM lowering 与商复用；
 - `73_cfg_dead_store.tc`：跨分支覆盖的局部死存储删除。
 - `74_move_aware_coalescing.tc`：移动感知建图消除循环归纳变量搬移；
 - `75_loop_bound_materialization.tc`：旋转后循环边界只在前置块物化一次；
 - `76_zero_register_selection.tc`：零值存储直接使用 RV32 `zero` 寄存器。
+- `77_induction_strength_reduce.tc`：矩阵式嵌套循环中的 `i * stride`
+  转换为循环携带的加法归纳量。
 
 测试时同时执行普通模式与 `-opt` 模式，并与 GCC 或 ToyC 特定语义的期望
 结果对照；生成的 RV32IM 汇编使用交叉汇编器检查，并在
 `qemu-system-riscv32` 裸机退出桩中执行。原有 73 个回归测例的普通模式和
-优化模式共 146 次 RV32 运行全部通过；新增 3 个针对性测例后，当前 76 个
-测例的普通/优化模式共 152 份汇编均已通过 RV32IM 交叉汇编和链接检查。
+优化模式共 146 次 RV32 运行全部通过；新增 4 个针对性测例后，当前 77 个
+测例的普通/优化模式共 154 份汇编均已通过 RV32IM 交叉汇编和链接检查。
 
 本轮在本地 RV32 QEMU 压力程序上的对比结果（绝对时间受宿主机影响）：
 
@@ -360,14 +382,12 @@ LLVM IR 需要在支配边界插入 SSA `phi`；本项目 IR 允许虚拟寄存�
 绝对时间会受 QEMU 翻译缓存和宿主机调度影响，因此性能判断同时采用热身后
 时间、热点循环动态指令结构与静态访存统计，而不依赖单次墙钟结果。
 
-## 16. LLVM 对照资料
+## 17. LLVM 对照资料
 
 本实现没有使用 LLVM 框架或复制其代码，只参考了这些算法接口与成本模型：
 
 - [Promote Memory to Register](https://llvm.org/doxygen/PromoteMemoryToRegister_8cpp.html)：
   可提升内存对象的寄存器化与控制流合流处理；
-- [SignedDivisionByConstantInfo](https://llvm.org/doxygen/structllvm_1_1SignedDivisionByConstantInfo.html)：
-  有符号常量除法所需的 magic number 和 shift；
 - [LoopUnrollPass](https://llvm.org/doxygen/classllvm_1_1LoopUnrollPass.html)：
   完全/部分展开与代码增长阈值；
 - [GlobalOpt](https://llvm.org/doxygen/GlobalOpt_8cpp.html)：

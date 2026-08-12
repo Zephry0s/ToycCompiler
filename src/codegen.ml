@@ -71,52 +71,6 @@ let cheap_multiply_shape n =
     Some (ShiftSub (log2_power_of_two (magnitude + 1)), n < 0)
   else None
 
-(* Compute the multiplier and post-shift for exact signed division by a
-   non-power-of-two constant.  This is the 32-bit form of the algorithm used
-   by LLVM's SignedDivisionByConstantInfo (Hacker's Delight, chapter 10). *)
-let signed_division_magic divisor =
-  let divisor = normalize_i32 divisor in
-  let d = Int64.of_int divisor in
-  let ad = Int64.abs d in
-  let two31 = Int64.shift_left 1L 31 in
-  let t = Int64.add two31 (if divisor < 0 then 1L else 0L) in
-  let anc = Int64.sub (Int64.sub t 1L) (Int64.rem t ad) in
-  let p = ref 31 in
-  let q1 = ref (Int64.div two31 anc) in
-  let r1 = ref (Int64.sub two31 (Int64.mul !q1 anc)) in
-  let q2 = ref (Int64.div two31 ad) in
-  let r2 = ref (Int64.sub two31 (Int64.mul !q2 ad)) in
-  let delta = ref 0L in
-  let continue = ref true in
-  while !continue do
-    incr p;
-    q1 := Int64.mul !q1 2L;
-    r1 := Int64.mul !r1 2L;
-    if Int64.compare !r1 anc >= 0 then begin
-      q1 := Int64.add !q1 1L;
-      r1 := Int64.sub !r1 anc
-    end;
-    q2 := Int64.mul !q2 2L;
-    r2 := Int64.mul !r2 2L;
-    if Int64.compare !r2 ad >= 0 then begin
-      q2 := Int64.add !q2 1L;
-      r2 := Int64.sub !r2 ad
-    end;
-    delta := Int64.sub ad !r2;
-    continue :=
-      Int64.compare !q1 !delta < 0 ||
-      (Int64.compare !q1 !delta = 0 && !r1 = 0L)
-  done;
-  let magic = Int64.add !q2 1L in
-  let magic = if divisor < 0 then Int64.neg magic else magic in
-  let low32 = Int64.logand magic 0xffff_ffffL in
-  let signed_magic =
-    if Int64.compare low32 two31 >= 0 then
-      Int64.sub low32 0x1_0000_0000L
-    else low32
-  in
-  (Int64.to_int signed_magic, !p - 32)
-
 let is_compare = function
   | Eq | Neq | Lt | Gt | Le | Ge -> true
   | Add | Sub | Mul | Div | Mod | And | Or -> false
@@ -215,61 +169,6 @@ let emit_one buf spill_base reg_map = function
               dst dst (32 - shift) dst dst (32 - shift));
        Buffer.add_string buf
          (Printf.sprintf "  sub %s, %s, %s\n" dst dst spill_temp2)
-     | _ -> assert false);
-    Buffer.add_string buf store
-  | Binop (rd, ((Div | Mod) as op), v, VImm raw_divisor)
-    when
-      let divisor = normalize_i32 raw_divisor in
-      divisor <> 0 && divisor <> 1 && divisor <> -1 &&
-      signed_power_of_two_magnitude divisor = None ->
-    let divisor = normalize_i32 raw_divisor in
-    let magic, shift = signed_division_magic divisor in
-    let (src, load) = resolve_src reg_map spill_base spill_temp1 v in
-    let (dst, store) = resolve_dst reg_map spill_base spill_temp1 rd in
-    Buffer.add_string buf load;
-    let original, reload_original =
-      if op = Mod && src = dst then
-        if load = "" then begin
-          Buffer.add_string buf
-            (Printf.sprintf "  mv %s, %s\n" spill_temp1 src);
-          (spill_temp1, "")
-        end else
-          (src, load)
-      else
-        (src, "")
-    in
-    (* [mulh x, y, x] is legal: both inputs are consumed before x is
-       overwritten, so t6 can hold the magic constant and then the quotient. *)
-    Buffer.add_string buf
-      (Printf.sprintf "  li %s, %d\n  mulh %s, %s, %s\n"
-         spill_temp2 magic spill_temp2 src spill_temp2);
-    if divisor > 0 && magic < 0 then
-      Buffer.add_string buf
-        (Printf.sprintf "  add %s, %s, %s\n"
-           spill_temp2 spill_temp2 src)
-    else if divisor < 0 && magic > 0 then
-      Buffer.add_string buf
-        (Printf.sprintf "  sub %s, %s, %s\n"
-           spill_temp2 spill_temp2 src);
-    if shift > 0 then
-      Buffer.add_string buf
-        (Printf.sprintf "  srai %s, %s, %d\n"
-           spill_temp2 spill_temp2 shift);
-    Buffer.add_string buf
-      (Printf.sprintf "  srli %s, %s, 31\n  add %s, %s, %s\n"
-         dst spill_temp2 spill_temp2 spill_temp2 dst);
-    (match op with
-     | Div ->
-       if dst <> spill_temp2 then
-         Buffer.add_string buf
-           (Printf.sprintf "  mv %s, %s\n" dst spill_temp2)
-     | Mod ->
-       Buffer.add_string buf
-         (Printf.sprintf "  li %s, %d\n  mul %s, %s, %s\n"
-            dst divisor spill_temp2 spill_temp2 dst);
-       Buffer.add_string buf reload_original;
-       Buffer.add_string buf
-         (Printf.sprintf "  sub %s, %s, %s\n" dst original spill_temp2)
      | _ -> assert false);
     Buffer.add_string buf store
   | Binop (rd, Mul, value, VImm constant)
