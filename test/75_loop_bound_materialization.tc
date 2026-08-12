@@ -1,0 +1,13 @@
+int tail_sum(int start) {
+  int i = start;
+  int sum = 0;
+  while (i < 1000) {
+    sum = sum + i % 7;
+    i = i + 1;
+  }
+  return sum;
+}
+
+int main() {
+  return tail_sum(997);
+}

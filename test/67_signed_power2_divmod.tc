@@ -1,0 +1,21 @@
+int verify_power2(int value, int large) {
+  if (value == 123)
+    return verify_power2(value + 1, large);
+  if (value / 8 != -15432098)
+    return 1;
+  if (value % 8 != -5)
+    return 2;
+  if (value / -16 != 7716049)
+    return 3;
+  if (value % -16 != -5)
+    return 4;
+  if (large / -2147483648 != 0)
+    return 5;
+  if (large % -2147483648 != 1073741824)
+    return 6;
+  return 0;
+}
+
+int main() {
+  return verify_power2(-123456789, 1073741824);
+}

@@ -1,0 +1,10 @@
+int state = 7;
+
+void reset_state() {
+  state = 0;
+}
+
+int main() {
+  reset_state();
+  return state;
+}

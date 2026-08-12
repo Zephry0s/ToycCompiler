@@ -1,0 +1,73 @@
+int bump(int x) {
+  return x + 1;
+}
+
+int main() {
+  int a01 = 1;
+  int a02 = 2;
+  int a03 = 3;
+  int a04 = 4;
+  int a05 = 5;
+  int a06 = 6;
+  int a07 = 7;
+  int a08 = 8;
+  int a09 = 9;
+  int a10 = 10;
+  int a11 = 11;
+  int a12 = 12;
+  int a13 = 13;
+  int a14 = 14;
+  int a15 = 15;
+  int a16 = 16;
+  int a17 = 17;
+  int a18 = 18;
+  int a19 = 19;
+  int a20 = 20;
+  int a21 = 21;
+  int a22 = 22;
+  int a23 = 23;
+  int a24 = 24;
+  int a25 = 25;
+  int a26 = 26;
+  int a27 = 27;
+  int a28 = 28;
+  int a29 = 29;
+  int a30 = 30;
+  int i = 0;
+  while (i < 20) {
+    a01 = a01 + bump(i + 1);
+    a02 = a02 + bump(i + 2);
+    a03 = a03 + bump(i + 3);
+    a04 = a04 + bump(i + 4);
+    a05 = a05 + bump(i + 5);
+    a06 = a06 + bump(i + 6);
+    a07 = a07 + bump(i + 7);
+    a08 = a08 + bump(i + 8);
+    a09 = a09 + bump(i + 9);
+    a10 = a10 + bump(i + 10);
+    a11 = a11 + bump(i + 11);
+    a12 = a12 + bump(i + 12);
+    a13 = a13 + bump(i + 13);
+    a14 = a14 + bump(i + 14);
+    a15 = a15 + bump(i + 15);
+    a16 = a16 + bump(i + 16);
+    a17 = a17 + bump(i + 17);
+    a18 = a18 + bump(i + 18);
+    a19 = a19 + bump(i + 19);
+    a20 = a20 + bump(i + 20);
+    a21 = a21 + bump(i + 21);
+    a22 = a22 + bump(i + 22);
+    a23 = a23 + bump(i + 23);
+    a24 = a24 + bump(i + 24);
+    a25 = a25 + bump(i + 25);
+    a26 = a26 + bump(i + 26);
+    a27 = a27 + bump(i + 27);
+    a28 = a28 + bump(i + 28);
+    a29 = a29 + bump(i + 29);
+    a30 = a30 + bump(i + 30);
+    i = i + 1;
+  }
+  return a01 + a02 + a03 + a04 + a05 + a06 + a07 + a08 + a09 + a10
+       + a11 + a12 + a13 + a14 + a15 + a16 + a17 + a18 + a19 + a20
+       + a21 + a22 + a23 + a24 + a25 + a26 + a27 + a28 + a29 + a30;
+}

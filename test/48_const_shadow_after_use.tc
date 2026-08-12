@@ -1,0 +1,7 @@
+const int value = 5;
+
+int main() {
+  int before = value;
+  const int value = 9;
+  return before;
+}

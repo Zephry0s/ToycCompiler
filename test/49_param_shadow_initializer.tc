@@ -1,0 +1,8 @@
+int increment(int value) {
+  int value = value + 1;
+  return value;
+}
+
+int main() {
+  return increment(6);
+}

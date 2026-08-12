@@ -1,0 +1,11 @@
+const int WRAPPED_ADD = 2147483647 + 1;
+const int WRAPPED_MUL = 65536 * 65536;
+const int INT_MIN_VALUE = -2147483647 - 1;
+const int WRAPPED_LITERAL = 4294967296;
+
+int main() {
+  return (WRAPPED_ADD < 0)
+       + (WRAPPED_MUL == 0) * 2
+       + (INT_MIN_VALUE == WRAPPED_ADD) * 4
+       + (WRAPPED_LITERAL == 0) * 8;
+}

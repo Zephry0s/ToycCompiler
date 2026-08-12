@@ -17,7 +17,7 @@ ToyC 语言的完整编译器，使用 OCaml 实现，将 ToyC 源文件编译�
 │   ├── semant.ml         # 语义分析、符号表构建
 │   ├── ir.ml             # 中间表示（IR）类型定义
 │   ├── irgen.ml          # AST → IR 生成
-│   ├── reg_alloc.ml      # 寄存器分配（线性扫描）
+│   ├── reg_alloc.ml      # 寄存器分配（干涉图着色）
 │   ├── opt.ml            # IR 优化（DCE、CSE）
 │   ├── codegen.ml        # IR → RISC-V32 汇编生成
 │   └── main.ml           # 编译器入口
@@ -52,7 +52,7 @@ make clean && make
 # 从 stdin 读取
 ./toyc < test/02_add.tc > result/output.s
 
-# 开启优化（DCE + CSE）
+# 开启优化
 ./toyc -opt test/38_prime.tc > result/output.s
 ```
 
@@ -83,11 +83,20 @@ make clean && make
 |------|----------|------|
 | 常量折叠 | `semant.ml` / `irgen.ml` | 编译期求值 `const` 表达式，不产生运行时指令 |
 | 短路求值 | `irgen.ml` | `&&` / `\|\|` 使用跳转指令实现 lazy 求值 |
-| 线性扫描寄存器分配 | `reg_alloc.ml` | 活跃变量分析 + 线性扫描，含 spill；按需保存被调用者保存寄存器（`s0`–`s11`） |
+| 干涉图着色寄存器分配 | `reg_alloc.ml` | CFG 活跃分析 + 循环深度加权 spill；调用感知着色并按需保存 `s0`–`s11` |
 | 死代码删除（DCE） | `opt.ml` | 删除定义了从未被使用的虚拟寄存器的纯计算指令，迭代至不动点 |
-| 公共子表达式消除（CSE） | `opt.ml` | 基本块内缓存已计算表达式，重复出现时替换为 `mov`，消除冗余计算 |
+| CFG 死存储删除（DSE） | `opt.ml` | 通过局部槽内存活跃分析删除跨基本块也不可观察的栈写入 |
+| CFG 全局值传播 | `opt.ml` | 跨基本块传播常量与复写，并删除不可达块 |
+| 全局公共子表达式消除（CSE） | `opt.ml` | 可用表达式数据流分析、交换律规范化和局部栈槽转发 |
+| 模块级全局量优化 | `opt.ml` | 只读全局常量化；无调用函数中的热点可变全局寄存器化 |
+| 自底向上叶函数内联 | `opt.ml` | 六轮内联，支持局部变量、全局副作用、分支、循环、多返回点和 `void` helper |
+| 直接尾递归消除 | `opt.ml` | 参数槽更新后跳回函数体入口，复用当前栈帧 |
+| 循环优化 | `opt.ml` | 不变量外提、预算式完全/部分展开、循环边界物化和安全旋转 |
+| 函数级局部槽提升 | `opt.ml` | 将所有不逃逸局部槽提升为虚拟寄存器，由图着色决定实际 spill |
+| 调用开销优化 | `reg_alloc.ml` / `codegen.ml` | 跨调用值使用 `s` 寄存器或 spill，取消固定保存全部 `t` 寄存器 |
+| RISC-V 指令选择 | `codegen.ml` | 立即数、移位加减、magic 常量除模、商余复用、比较—分支融合及栈帧收缩 |
 
-DCE 和 CSE 在传入 `-opt` 参数时启用，两者交替迭代至不动点。
+完整的优化流程、正确性条件和回归测试见 [OPTIMIZATIONS.md](OPTIMIZATIONS.md)。
 
 ## 测试
 

@@ -1,0 +1,13 @@
+int accumulate(int start, int limit) {
+  int i = start;
+  int sum = 0;
+  while (i < limit) {
+    sum = sum + i;
+    i = i + 1;
+  }
+  return sum;
+}
+
+int main() {
+  return accumulate(3, 8);
+}

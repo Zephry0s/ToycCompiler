@@ -1,0 +1,13 @@
+int count = 0;
+
+int tick() {
+  count = count + 1;
+  return count;
+}
+
+int main() {
+  int dead = tick();
+  dead = 99;
+  int unused = 123;
+  return count;
+}
