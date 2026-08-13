@@ -94,7 +94,7 @@ make clean && make
 | 循环优化 | `opt.ml` | 不变量外提、预算式完全/部分展开、循环边界物化和安全旋转 |
 | 函数级局部槽提升 | `opt.ml` | 将所有不逃逸局部槽提升为虚拟寄存器，由图着色决定实际 spill |
 | 调用开销优化 | `reg_alloc.ml` / `codegen.ml` | 跨调用值使用 `s` 寄存器或 spill，取消固定保存全部 `t` 寄存器 |
-| RISC-V 指令选择 | `codegen.ml` | 立即数、移位加减、RV32IM 原生除模、商余复用、比较—分支融合及栈帧收缩 |
+| RISC-V 指令选择 | `codegen.ml` | 立即数、移位加减、常量除模魔数序列与缓存、商余复用、比较—分支融合及栈帧收缩 |
 
 完整的优化流程、正确性条件和回归测试见 [OPTIMIZATIONS.md](OPTIMIZATIONS.md)。
 

@@ -1178,12 +1178,9 @@ let materialize_loop_constants (f : func_ir) : func_ir =
         else
           match op, side with
           | (Div | Mod), `Left -> true
-          (* RV32IM has native div/rem.  Materializing a non-power-of-two
-             divisor once in the preheader is substantially cheaper than
-             rebuilding a long magic-number sequence on every iteration.
-             Power-of-two divisors keep their immediate form so codegen can
-             still select its short signed shift/mask sequence. *)
-          | (Div | Mod), `Right -> not (signed_power_of_two value)
+          (* Preserve constant divisors for target-specific lowering: powers
+             of two use shifts, all others use the measured magic sequence. *)
+          | (Div | Mod), `Right -> false
           | Mul, _ -> not (cheap_multiply_constant value)
           | Add, _ -> not (fits_i12 value)
           | Sub, `Left -> true
@@ -1656,8 +1653,10 @@ let loop_invariant_code_motion (f : func_ir) : func_ir =
    The old optimizer guessed loop counts from unrelated [li] instructions.
    Here we require a canonical [i < constant] condition, a constant reaching
    store before the header, one [i = i + 1] update, and a body without control
-   flow or calls.  If the exact trip count is divisible by four (or two), the
-   body can be repeated with no remainder loop and no speculative iteration.
+   flow or calls.  Small bodies may use an eight-way factor; larger bodies stay
+   at four or two to keep code size and register pressure bounded.  Every case
+   requires exact divisibility, so no remainder loop or speculative iteration
+   is introduced.
    This is the small ToyC counterpart of LLVM's ScalarEvolution-assisted
    LoopUnroll legality check. *)
 let unroll_proven_counted_loops (f : func_ir) : func_ir =
@@ -1842,6 +1841,9 @@ let unroll_proven_counted_loops (f : func_ir) : func_ir =
                             end else begin
                               let factor =
                                 if Int64.compare trip 0L > 0 &&
+                                   Int64.rem trip 8L = 0L &&
+                                   List.length body <= 12 then 8
+                                else if Int64.compare trip 0L > 0 &&
                                    Int64.rem trip 4L = 0L then 4
                                 else if Int64.compare trip 0L > 0 &&
                                         Int64.rem trip 2L = 0L then 2
@@ -2339,24 +2341,10 @@ let dce (f : func_ir) : func_ir =
   in
   { f with fir_body = loop f.fir_body }
 
-(* Coalesce a one-use temporary into the mutable destination introduced by
-   loop/parameter caching.  RV32 instructions permit rd to equal a source, so
-   patterns such as [%tmp = add %cache, 1; %cache = mov %tmp] need no move. *)
+(* Coalesce temporary results into mutable destinations and forward the new
+   destination until the temporary's next definition.  This removes copies
+   feeding rotated latches even when the temporary has multiple local uses. *)
 let fold_defs_into_moves (instrs : instr list) : instr list =
-  let use_counts = Hashtbl.create 64 in
-  List.iter (fun instr ->
-    List.iter (fun reg ->
-      if reg <> 0 then begin
-        let old =
-          match Hashtbl.find_opt use_counts reg with Some n -> n | None -> 0
-        in
-        Hashtbl.replace use_counts reg (old + 1)
-      end
-    ) (src_vregs instr)
-  ) instrs;
-  let used_once reg =
-    Hashtbl.find_opt use_counts reg = Some 1
-  in
   let replace_result new_rd = function
     | Binop (_, op, left, right) -> Binop (new_rd, op, left, right)
     | Unop (_, op, value) -> Unop (new_rd, op, value)
@@ -2367,11 +2355,61 @@ let fold_defs_into_moves (instrs : instr list) : instr list =
     | Call (_, name, args) -> Call (new_rd, name, args)
     | _ -> assert false
   in
+  let move_before_independent_updates source instructions =
+    let rec find skipped budget = function
+      | Mov (destination, VReg actual) as move :: rest
+        when actual = source &&
+             List.for_all (fun instr ->
+               def_vreg instr <> Some destination &&
+               not (List.mem destination (src_vregs instr))
+             ) skipped ->
+        Some (move, List.rev skipped, rest)
+      | (Binop _ | Unop _ | Li _ | La _) as instr :: rest
+        when budget > 0 &&
+             def_vreg instr <> Some source &&
+             not (List.mem source (src_vregs instr)) ->
+        find (instr :: skipped) (budget - 1) rest
+      | _ -> None
+    in
+    find [] 8 instructions
+  in
   let rec scan acc = function
     | defining :: Mov (destination, VReg source) :: rest
-      when def_vreg defining = Some source && used_once source ->
-      scan (replace_result destination defining :: acc) rest
-    | instr :: rest -> scan (instr :: acc) rest
+      when def_vreg defining = Some source && destination <> source ->
+      let destination_redefined = ref false in
+      let active = ref true in
+      let valid = ref true in
+      List.iter (fun instr ->
+        if !active then begin
+          if !destination_redefined && List.mem source (src_vregs instr) then
+            valid := false;
+          if def_vreg instr = Some source then active := false
+          else if def_vreg instr = Some destination then
+            destination_redefined := true
+        end
+      ) rest;
+      if !valid then begin
+        let subst = Hashtbl.create 1 in
+        Hashtbl.add subst source (VReg destination);
+        let active = ref true in
+        let rest =
+          List.map (fun instr ->
+            let rewritten = if !active then subst_instr subst instr else instr in
+            if def_vreg instr = Some source then active := false;
+            rewritten
+          ) rest
+        in
+        scan (replace_result destination defining :: acc) rest
+      end else
+        scan (Mov (destination, VReg source) :: defining :: acc) rest
+    | defining :: rest ->
+      (match def_vreg defining with
+       | Some source ->
+         (match move_before_independent_updates source rest with
+          | Some (move, skipped, remaining) ->
+            scan acc (defining :: move :: (skipped @ remaining))
+          | None -> scan (defining :: acc) rest)
+       | None -> scan (defining :: acc) rest)
     | [] -> List.rev acc
   in
   scan [] instrs
