@@ -422,8 +422,11 @@ let global_copy_prop (f : func_ir) : func_ir =
            (match operand with
             | VReg source when source = rd -> state
             | _ -> IntMap.add rd operand state)
-         | Li (_, constant) ->
-           IntMap.add rd (VImm (normalize_i32 constant)) state
+         (* Constants are handled by [global_const_prop].  Keeping them out
+            of this copy-only lattice is important for loop-invariant [li]
+            instructions: a backedge must not turn a deliberately hoisted
+            register value back into an immediate in the hot block. *)
+         | Li _ -> state
          | _ -> state)
     in
     let meet states =
@@ -1175,10 +1178,8 @@ let materialize_loop_constants (f : func_ir) : func_ir =
         else
           match op, side with
           | (Div | Mod), `Left -> true
-          (* Keep an immediate divisor visible to codegen: powers of two use
-             shifts and all other constants use a magic multiply-high
-             sequence.  Turning it into a vreg here would force a hardware
-             div/rem in the hot loop. *)
+          (* Preserve constant divisors for target-specific lowering: powers
+             of two use shifts, all others use the measured magic sequence. *)
           | (Div | Mod), `Right -> false
           | Mul, _ -> not (cheap_multiply_constant value)
           | Add, _ -> not (fits_i12 value)
@@ -1404,6 +1405,135 @@ let rotate_simple_while_loops (f : func_ir) : func_ir =
       { f with fir_body = List.rev !result }
     end
 
+(* After rotation the hot comparison lives on the backedge, while the older
+   structured-loop constant pass has already run.  Materialize immediate
+   branch operands in the unique fall-through preheader so RV32 does not need
+   to execute [li] on every iteration.  The definition is placed before the
+   header label: entry executes it once and backedges jump over it. *)
+let materialize_backedge_branch_constants (f : func_ir) : func_ir =
+  let cfg = build_cfg f.fir_body in
+  let block_count = Array.length cfg.cfg_blocks in
+  let instruction_count = Array.length cfg.cfg_instrs in
+  if block_count = 0 || instruction_count = 0 then f
+  else begin
+    let rewritten = Array.copy cfg.cfg_instrs in
+    let before = Array.make instruction_count [] in
+    let next_vreg = ref (find_max_vreg f.fir_body + 1) in
+    let is_compare = function
+      | Eq | Neq | Lt | Gt | Le | Ge -> true
+      | Add | Sub | Mul | Div | Mod | And | Or -> false
+    in
+    let feeds_branch idx rd =
+      idx + 1 < instruction_count &&
+      match rewritten.(idx + 1) with
+      | Bz (VReg reg, _) | Bnz (VReg reg, _) -> reg = rd
+      | _ -> false
+    in
+    let headers = ref IntSet.empty in
+    Array.iter (fun block ->
+      List.iter (fun successor ->
+        if successor <= block.cb_id then
+          headers := IntSet.add successor !headers
+      ) block.cb_succs
+    ) cfg.cfg_blocks;
+    (* Inner headers have larger block ids.  Rewriting them first also keeps
+       an outer loop from redundantly materializing the same inner bound. *)
+    IntSet.elements !headers
+    |> List.rev
+    |> List.iter (fun header_id ->
+      let latches =
+        Array.fold_left (fun found block ->
+          if block.cb_id >= header_id &&
+             List.mem header_id block.cb_succs then
+            block.cb_id :: found
+          else found
+        ) [] cfg.cfg_blocks
+      in
+      match latches with
+      | [] -> ()
+      | _ ->
+        let last_id = List.fold_left max header_id latches in
+        let outside_predecessors =
+          List.filter (fun predecessor ->
+            predecessor < header_id || predecessor > last_id
+          ) cfg.cfg_blocks.(header_id).cb_preds
+        in
+        (match outside_predecessors with
+         | [preheader_id] when preheader_id + 1 = header_id ->
+           let preheader = cfg.cfg_blocks.(preheader_id) in
+           let falls_through =
+             match rewritten.(preheader.cb_end) with
+             | Jmp _ | Ret _ -> false
+             | _ -> true
+           in
+           if falls_through then begin
+             let counts = Hashtbl.create 8 in
+             let note value =
+               let value = normalize_i32 value in
+               if value <> 0 then begin
+                 let count =
+                   match Hashtbl.find_opt counts value with
+                   | Some old -> old
+                   | None -> 0
+                 in
+                 Hashtbl.replace counts value (count + 1)
+               end
+             in
+             let first = cfg.cfg_blocks.(header_id).cb_start in
+             let last = cfg.cfg_blocks.(last_id).cb_end in
+             for idx = first to last do
+               match rewritten.(idx) with
+               | Binop (rd, op, VImm value, right)
+                 when is_compare op && feeds_branch idx rd ->
+                 note value;
+                 (match right with VImm value -> note value | _ -> ())
+               | Binop (rd, op, _, VImm value)
+                 when is_compare op && feeds_branch idx rd ->
+                 note value
+               | _ -> ()
+             done;
+             let selected =
+               Hashtbl.to_seq counts
+               |> List.of_seq
+               |> List.sort (fun (value1, count1) (value2, count2) ->
+                    let by_count = compare count2 count1 in
+                    if by_count <> 0 then by_count else compare value1 value2)
+               |> take 2
+             in
+             let registers = Hashtbl.create (List.length selected) in
+             List.iter (fun (value, _) ->
+               let reg = !next_vreg in
+               incr next_vreg;
+               Hashtbl.add registers value reg;
+               before.(first) <- before.(first) @ [Li (reg, value)]
+             ) selected;
+             let rewrite_operand = function
+               | VImm value as operand ->
+                 (match Hashtbl.find_opt registers (normalize_i32 value) with
+                  | Some reg -> VReg reg
+                  | None -> operand)
+               | operand -> operand
+             in
+             for idx = first to last do
+               rewritten.(idx) <-
+                 match rewritten.(idx) with
+                 | Binop (rd, op, left, right)
+                   when is_compare op && feeds_branch idx rd ->
+                   Binop (rd, op, rewrite_operand left,
+                     rewrite_operand right)
+                 | instr -> instr
+             done
+           end
+         | _ -> ())
+    );
+    let result = ref [] in
+    for idx = 0 to instruction_count - 1 do
+      List.iter (fun instr -> result := instr :: !result) before.(idx);
+      result := rewritten.(idx) :: !result
+    done;
+    { f with fir_body = List.rev !result }
+  end
+
 (* Hoist total, side-effect-free computations from structured loops.  Virtual
    registers are immutable before loop-slot caching, so a unique definition
    outside the loop (or another invariant definition) is a stable operand. *)
@@ -1523,8 +1653,10 @@ let loop_invariant_code_motion (f : func_ir) : func_ir =
    The old optimizer guessed loop counts from unrelated [li] instructions.
    Here we require a canonical [i < constant] condition, a constant reaching
    store before the header, one [i = i + 1] update, and a body without control
-   flow or calls.  If the exact trip count is divisible by four (or two), the
-   body can be repeated with no remainder loop and no speculative iteration.
+   flow or calls.  Small bodies may use an eight-way factor; larger bodies stay
+   at four or two to keep code size and register pressure bounded.  Every case
+   requires exact divisibility, so no remainder loop or speculative iteration
+   is introduced.
    This is the small ToyC counterpart of LLVM's ScalarEvolution-assisted
    LoopUnroll legality check. *)
 let unroll_proven_counted_loops (f : func_ir) : func_ir =
@@ -1555,91 +1687,6 @@ let unroll_proven_counted_loops (f : func_ir) : func_ir =
           | _ -> scan (idx - 1)
       in
       scan (header_idx - 1)
-    in
-    let evaluate_constant_body header_idx induction_reg induction_offset
-        trip body =
-      if Int64.compare trip 0L <= 0 || Int64.compare trip 256L > 0 then None
-      else
-        let registers = Hashtbl.create 64 in
-        let slots = Hashtbl.create 32 in
-        let written_slots = ref IntSet.empty in
-        let valid = ref true in
-        (* Record invariant constants materialized in the straight-line
-           preheader.  Global constant propagation has already rewritten most
-           such operands to immediates, but this also covers hoisted [li]s. *)
-        for idx = 0 to header_idx - 1 do
-          match arr.(idx) with
-          | Li (rd, value) ->
-            Hashtbl.replace registers rd (normalize_i32 value)
-          | Mov (rd, VImm value) ->
-            Hashtbl.replace registers rd (normalize_i32 value)
-          | _ -> ()
-        done;
-        List.iter (function
-          | Lw (_, 0, offset) | Sw (0, offset, _) ->
-            if not (Hashtbl.mem slots offset) then
-              (match reaching_initial header_idx offset with
-               | Some value -> Hashtbl.add slots offset value
-               | None -> valid := false)
-          | Lw _ | Sw _ -> valid := false
-          | _ -> ()
-        ) body;
-        let value_constant = function
-          | VImm value -> Some (normalize_i32 value)
-          | VReg 0 -> None
-          | VReg reg -> Hashtbl.find_opt registers reg
-        in
-        let execute = function
-          | Li (rd, value) ->
-            Hashtbl.replace registers rd (normalize_i32 value)
-          | Mov (rd, value) ->
-            (match value_constant value with
-             | Some constant -> Hashtbl.replace registers rd constant
-             | None -> valid := false)
-          | Unop (rd, op, value) ->
-            (match value_constant value with
-             | Some constant ->
-               Hashtbl.replace registers rd (eval_uop op constant)
-             | None -> valid := false)
-          | Binop (rd, op, left, right) ->
-            (match value_constant left, value_constant right with
-             | Some lhs, Some rhs
-               when not ((op = Div || op = Mod) && rhs = 0) ->
-               Hashtbl.replace registers rd (eval_binop op lhs rhs)
-             | _ -> valid := false)
-          | Lw (rd, 0, offset) ->
-            (match Hashtbl.find_opt slots offset with
-             | Some constant -> Hashtbl.replace registers rd constant
-             | None -> valid := false)
-          | Sw (0, offset, value) ->
-            (match value_constant value with
-             | Some constant ->
-               Hashtbl.replace slots offset constant;
-               written_slots := IntSet.add offset !written_slots
-             | None -> valid := false)
-          | La _ | Lw _ | Sw _ | Call _ | Ret _ | Jmp _ | Bz _ | Bnz _
-          | Label _ -> valid := false
-        in
-        let iterations = Int64.to_int trip in
-        for _ = 1 to iterations do
-          if !valid then begin
-            (match Hashtbl.find_opt slots induction_offset with
-             | Some induction ->
-               Hashtbl.replace registers induction_reg induction
-             | None -> valid := false);
-            if !valid then List.iter execute body
-          end
-        done;
-        if not !valid then None
-        else
-          let stores =
-            IntSet.elements !written_slots
-            |> List.filter_map (fun offset ->
-                 match Hashtbl.find_opt slots offset with
-                 | Some constant -> Some (Sw (0, offset, VImm constant))
-                 | None -> None)
-          in
-          Some stores
     in
     let clone_body body seeds tracked_result =
       let renames = Hashtbl.create 32 in
@@ -1759,20 +1806,12 @@ let unroll_proven_counted_loops (f : func_ir) : func_ir =
                            Int64.sub (Int64.of_int (normalize_i32 bound))
                              (Int64.of_int initial)
                          in
-                         (match evaluate_constant_body header_idx induction_reg
-                                  offset trip body with
-                          | Some stores ->
-                            replacement.(header_idx) <- Some stores;
-                            for idx = header_idx + 1 to exit_idx - 1 do
-                              removed.(idx) <- true
-                            done
-                          | None ->
-                            let full_unroll =
+                         let full_unroll =
                               Int64.compare trip 0L > 0 &&
                               Int64.compare trip 16L <= 0 &&
                               Int64.to_int trip * List.length body <= 192
-                            in
-                            if full_unroll then begin
+                         in
+                         if full_unroll then begin
                               let copies = ref body in
                               let previous_update = ref update_reg in
                               for _ = 2 to Int64.to_int trip do
@@ -1802,6 +1841,9 @@ let unroll_proven_counted_loops (f : func_ir) : func_ir =
                             end else begin
                               let factor =
                                 if Int64.compare trip 0L > 0 &&
+                                   Int64.rem trip 8L = 0L &&
+                                   List.length body <= 12 then 8
+                                else if Int64.compare trip 0L > 0 &&
                                    Int64.rem trip 4L = 0L then 4
                                 else if Int64.compare trip 0L > 0 &&
                                         Int64.rem trip 2L = 0L then 2
@@ -1822,7 +1864,7 @@ let unroll_proven_counted_loops (f : func_ir) : func_ir =
                                 replacement.(exit_idx - 1) <-
                                   Some (!copies @ [Jmp header])
                               end
-                            end)
+                            end
                        | _ -> ())
                     | _ -> ())
                  | _ -> ()))
@@ -2002,6 +2044,131 @@ let promote_local_slots (f : func_ir) : func_ir =
     in
     { f with fir_body = promoted }
 
+(* Replace a loop-varying multiply of a unit-step induction variable by an
+   add recurrence.  For example, [row * width] becomes a preheader seed and
+   [scaled += width] beside [row += 1].  Arithmetic is modulo 2^32 in both
+   forms, so the transformation preserves ToyC integer overflow semantics.
+
+   The pass runs after slot promotion and move folding, where an induction
+   update has the compact mutable-vreg form [%i = add %i, +/-1].  It accepts
+   nested control flow because the scaled update is placed immediately after
+   the unique induction update; break/continue paths that skip one also skip
+   the other. *)
+let reduce_induction_multiplication (f : func_ir) : func_ir =
+  let cfg = build_cfg f.fir_body in
+  let n = Array.length cfg.cfg_instrs in
+  if n = 0 then f
+  else begin
+    let rewritten = Array.copy cfg.cfg_instrs in
+    let before = Array.make n [] in
+    let after = Array.make n [] in
+    let next_vreg = ref (find_max_vreg f.fir_body + 1) in
+    let claimed_products = ref IntSet.empty in
+    let backedges =
+      Array.fold_left (fun edges block ->
+        List.fold_left (fun edges successor ->
+          if successor <= block.cb_id then
+            (successor, block.cb_id) :: edges
+          else edges
+        ) edges block.cb_succs
+      ) [] cfg.cfg_blocks
+      |> List.sort (fun (header1, latch1) (header2, latch2) ->
+           compare (latch1 - header1) (latch2 - header2))
+    in
+    List.iter (fun (header_id, latch_id) ->
+      let first = cfg.cfg_blocks.(header_id).cb_start in
+      let last = cfg.cfg_blocks.(latch_id).cb_end in
+      let definitions = Hashtbl.create 32 in
+      let note_definition reg =
+        let count =
+          match Hashtbl.find_opt definitions reg with
+          | Some old -> old
+          | None -> 0
+        in
+        Hashtbl.replace definitions reg (count + 1)
+      in
+      for idx = first to last do
+        Option.iter note_definition (def_vreg rewritten.(idx))
+      done;
+      let defined_once reg = Hashtbl.find_opt definitions reg = Some 1 in
+      let invariant = function
+        | VImm value -> not (cheap_multiply_constant value)
+        | VReg reg -> reg <> 0 && not (Hashtbl.mem definitions reg)
+      in
+      let updates = ref [] in
+      for idx = first to last do
+        match rewritten.(idx) with
+        | Binop (rd, Add, VReg source, VImm step)
+          when rd = source && (step = 1 || step = -1) && defined_once rd ->
+          updates := (rd, idx, step) :: !updates
+        | Binop (rd, Add, VImm step, VReg source)
+          when rd = source && (step = 1 || step = -1) && defined_once rd ->
+          updates := (rd, idx, step) :: !updates
+        | Binop (temporary, Add, VReg induction, VImm step)
+          when (step = 1 || step = -1) && idx + 1 <= last &&
+               defined_once induction && defined_once temporary ->
+          (match rewritten.(idx + 1) with
+           | Mov (destination, VReg source)
+             when destination = induction && source = temporary ->
+             updates := (induction, idx + 1, step) :: !updates
+           | _ -> ())
+        | Binop (temporary, Add, VImm step, VReg induction)
+          when (step = 1 || step = -1) && idx + 1 <= last &&
+               defined_once induction && defined_once temporary ->
+          (match rewritten.(idx + 1) with
+           | Mov (destination, VReg source)
+             when destination = induction && source = temporary ->
+             updates := (induction, idx + 1, step) :: !updates
+           | _ -> ())
+        | _ -> ()
+      done;
+      List.iter (fun (induction, update_idx, step) ->
+        let products = Hashtbl.create 8 in
+        let note_product idx rd multiplier =
+          if idx < update_idx && invariant multiplier &&
+             not (IntSet.mem idx !claimed_products) then begin
+            let old =
+              match Hashtbl.find_opt products multiplier with
+              | Some entries -> entries
+              | None -> []
+            in
+            Hashtbl.replace products multiplier ((idx, rd) :: old)
+          end
+        in
+        for idx = first to update_idx - 1 do
+          match rewritten.(idx) with
+          | Binop (rd, Mul, VReg reg, multiplier) when reg = induction ->
+            note_product idx rd multiplier
+          | Binop (rd, Mul, multiplier, VReg reg) when reg = induction ->
+            note_product idx rd multiplier
+          | _ -> ()
+        done;
+        Hashtbl.iter (fun multiplier entries ->
+          let cache = !next_vreg in
+          incr next_vreg;
+          before.(first) <- before.(first) @
+            [Binop (cache, Mul, VReg induction, multiplier)];
+          List.iter (fun (idx, rd) ->
+            rewritten.(idx) <- Mov (rd, VReg cache);
+            claimed_products := IntSet.add idx !claimed_products
+          ) entries;
+          let update =
+            if step = 1 then Binop (cache, Add, VReg cache, multiplier)
+            else Binop (cache, Sub, VReg cache, multiplier)
+          in
+          after.(update_idx) <- after.(update_idx) @ [update]
+        ) products
+      ) !updates
+    ) backedges;
+    let result = ref [] in
+    for idx = 0 to n - 1 do
+      List.iter (fun instr -> result := instr :: !result) before.(idx);
+      result := rewritten.(idx) :: !result;
+      List.iter (fun instr -> result := instr :: !result) after.(idx)
+    done;
+    { f with fir_body = List.rev !result }
+  end
+
 (* --- Driver for the local passes --- *)
 
 let optimize_func_body (body : instr list) : instr list =
@@ -2174,24 +2341,10 @@ let dce (f : func_ir) : func_ir =
   in
   { f with fir_body = loop f.fir_body }
 
-(* Coalesce a one-use temporary into the mutable destination introduced by
-   loop/parameter caching.  RV32 instructions permit rd to equal a source, so
-   patterns such as [%tmp = add %cache, 1; %cache = mov %tmp] need no move. *)
+(* Coalesce temporary results into mutable destinations and forward the new
+   destination until the temporary's next definition.  This removes copies
+   feeding rotated latches even when the temporary has multiple local uses. *)
 let fold_defs_into_moves (instrs : instr list) : instr list =
-  let use_counts = Hashtbl.create 64 in
-  List.iter (fun instr ->
-    List.iter (fun reg ->
-      if reg <> 0 then begin
-        let old =
-          match Hashtbl.find_opt use_counts reg with Some n -> n | None -> 0
-        in
-        Hashtbl.replace use_counts reg (old + 1)
-      end
-    ) (src_vregs instr)
-  ) instrs;
-  let used_once reg =
-    Hashtbl.find_opt use_counts reg = Some 1
-  in
   let replace_result new_rd = function
     | Binop (_, op, left, right) -> Binop (new_rd, op, left, right)
     | Unop (_, op, value) -> Unop (new_rd, op, value)
@@ -2202,11 +2355,61 @@ let fold_defs_into_moves (instrs : instr list) : instr list =
     | Call (_, name, args) -> Call (new_rd, name, args)
     | _ -> assert false
   in
+  let move_before_independent_updates source instructions =
+    let rec find skipped budget = function
+      | Mov (destination, VReg actual) as move :: rest
+        when actual = source &&
+             List.for_all (fun instr ->
+               def_vreg instr <> Some destination &&
+               not (List.mem destination (src_vregs instr))
+             ) skipped ->
+        Some (move, List.rev skipped, rest)
+      | (Binop _ | Unop _ | Li _ | La _) as instr :: rest
+        when budget > 0 &&
+             def_vreg instr <> Some source &&
+             not (List.mem source (src_vregs instr)) ->
+        find (instr :: skipped) (budget - 1) rest
+      | _ -> None
+    in
+    find [] 8 instructions
+  in
   let rec scan acc = function
     | defining :: Mov (destination, VReg source) :: rest
-      when def_vreg defining = Some source && used_once source ->
-      scan (replace_result destination defining :: acc) rest
-    | instr :: rest -> scan (instr :: acc) rest
+      when def_vreg defining = Some source && destination <> source ->
+      let destination_redefined = ref false in
+      let active = ref true in
+      let valid = ref true in
+      List.iter (fun instr ->
+        if !active then begin
+          if !destination_redefined && List.mem source (src_vregs instr) then
+            valid := false;
+          if def_vreg instr = Some source then active := false
+          else if def_vreg instr = Some destination then
+            destination_redefined := true
+        end
+      ) rest;
+      if !valid then begin
+        let subst = Hashtbl.create 1 in
+        Hashtbl.add subst source (VReg destination);
+        let active = ref true in
+        let rest =
+          List.map (fun instr ->
+            let rewritten = if !active then subst_instr subst instr else instr in
+            if def_vreg instr = Some source then active := false;
+            rewritten
+          ) rest
+        in
+        scan (replace_result destination defining :: acc) rest
+      end else
+        scan (Mov (destination, VReg source) :: defining :: acc) rest
+    | defining :: rest ->
+      (match def_vreg defining with
+       | Some source ->
+         (match move_before_independent_updates source rest with
+          | Some (move, skipped, remaining) ->
+            scan acc (defining :: move :: (skipped @ remaining))
+          | None -> scan (defining :: acc) rest)
+       | None -> scan (defining :: acc) rest)
     | [] -> List.rev acc
   in
   scan [] instrs
@@ -2236,9 +2439,10 @@ let optimize_func (f : func_ir) : func_ir =
     |> loop 0
     |> materialize_loop_constants
     |> rotate_simple_while_loops
+    |> materialize_backedge_branch_constants
     |> promote_local_slots
   in
-  { optimized with
+  let cleaned = { optimized with
     fir_body =
       optimized.fir_body
       |> const_fold
@@ -2250,6 +2454,18 @@ let optimize_func (f : func_ir) : func_ir =
       |> peephole
       |> remove_dead_after_jmp
       |> remove_unused_labels }
+  in
+  let reduced = reduce_induction_multiplication cleaned in
+  if reduced.fir_body = cleaned.fir_body then cleaned
+  else
+    { reduced with
+      fir_body =
+        reduced.fir_body
+        |> copy_prop
+        |> fold_defs_into_moves
+        |> dead_code_elim
+        |> peephole
+        |> remove_unused_labels }
 
 (* Inline small leaf functions.
 

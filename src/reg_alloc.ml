@@ -488,7 +488,17 @@ let graph_color (phys_regs : string array) (avoid_argument_regs : ISet.t)
       (match def_opt instr with
        | Some rd ->
          add_weight rd weight;
-         ISet.iter (fun live_reg -> add_edge rd live_reg) !live;
+         (* A move's source and destination may share a color: the source is
+            consumed before the destination becomes live.  Excluding that
+            single source from the interference edges is the standard
+            move-aware construction and lets the existing preference logic
+            erase loop-carried and copy-propagation moves. *)
+         let interferes_with =
+           match instr with
+           | Mov (_, VReg source) -> ISet.remove source !live
+           | _ -> !live
+         in
+         ISet.iter (fun live_reg -> add_edge rd live_reg) interferes_with;
          (match instr with
           | Mov (_, VReg source) -> add_move rd source
           | _ -> ())

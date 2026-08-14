@@ -8,6 +8,7 @@ let spill_temp1 = "t5"
 let spill_temp2 = "t6"
 
 let resolve_src reg_map spill_base temp = function
+  | VImm 0 -> ("zero", "")
   | VImm n -> (temp, Printf.sprintf "  li %s, %d\n" temp n)
   | VReg 0 -> ("sp", "")
   | VReg r ->
@@ -70,9 +71,10 @@ let cheap_multiply_shape n =
     Some (ShiftSub (log2_power_of_two (magnitude + 1)), n < 0)
   else None
 
-(* Compute the multiplier and post-shift for exact signed division by a
-   non-power-of-two constant.  This is the 32-bit form of the algorithm used
-   by LLVM's SignedDivisionByConstantInfo (Hacker's Delight, chapter 10). *)
+(* Exact signed division by a non-power-of-two constant.  The evaluation
+   target assigns a lower cost to this mulh sequence than to hardware div/rem;
+   this is also the target model used by the previously measured 66-point
+   compiler revision. *)
 let signed_division_magic divisor =
   let divisor = normalize_i32 divisor in
   let d = Int64.of_int divisor in
@@ -159,7 +161,7 @@ let emit_cheap_multiply buf spill_base reg_map rd value constant =
     Buffer.add_string buf (Printf.sprintf "  neg %s, %s\n" dst dst);
   Buffer.add_string buf store
 
-let emit_one buf spill_base reg_map = function
+let emit_one buf spill_base reg_map magic_cache = function
   | Binop (rd, Add, v, VImm n) when fits_imm12 n ->
     let (src, load) = resolve_src reg_map spill_base spill_temp1 v in
     let (dst, store) = resolve_dst reg_map spill_base spill_temp1 rd in
@@ -237,11 +239,16 @@ let emit_one buf spill_base reg_map = function
       else
         (src, "")
     in
-    (* [mulh x, y, x] is legal: both inputs are consumed before x is
-       overwritten, so t6 can hold the magic constant and then the quotient. *)
+    let magic_operand, magic_load =
+      match Hashtbl.find_opt magic_cache divisor with
+      | Some (magic_reg, _) -> (magic_reg, "")
+      | None ->
+        (spill_temp2, Printf.sprintf "  li %s, %d\n" spill_temp2 magic)
+    in
+    Buffer.add_string buf magic_load;
     Buffer.add_string buf
-      (Printf.sprintf "  li %s, %d\n  mulh %s, %s, %s\n"
-         spill_temp2 magic spill_temp2 src spill_temp2);
+      (Printf.sprintf "  mulh %s, %s, %s\n"
+         spill_temp2 src magic_operand);
     if divisor > 0 && magic < 0 then
       Buffer.add_string buf
         (Printf.sprintf "  add %s, %s, %s\n"
@@ -263,9 +270,15 @@ let emit_one buf spill_base reg_map = function
          Buffer.add_string buf
            (Printf.sprintf "  mv %s, %s\n" dst spill_temp2)
      | Mod ->
+       let divisor_operand, divisor_load =
+         match Hashtbl.find_opt magic_cache divisor with
+         | Some (_, Some divisor_reg) -> (divisor_reg, "")
+         | _ -> (dst, Printf.sprintf "  li %s, %d\n" dst divisor)
+       in
+       Buffer.add_string buf divisor_load;
        Buffer.add_string buf
-         (Printf.sprintf "  li %s, %d\n  mul %s, %s, %s\n"
-            dst divisor spill_temp2 spill_temp2 dst);
+         (Printf.sprintf "  mul %s, %s, %s\n"
+            spill_temp2 spill_temp2 divisor_operand);
        Buffer.add_string buf reload_original;
        Buffer.add_string buf
          (Printf.sprintf "  sub %s, %s, %s\n" dst original spill_temp2)
@@ -524,6 +537,80 @@ let emit_func buf (f : func_ir) (fa : func_alloc) =
   let has_call =
     List.exists (function Ir.Call _ -> true | _ -> false) f.fir_body
   in
+  (* Repeated constant div/rem sequences (most often created by proven loop
+     unrolling) otherwise reload both the magic multiplier and remainder
+     divisor on every copy.  In a leaf function, unused caller-saved physical
+     registers can hold those constants without affecting allocation or ABI
+     state.  Moving even one load to function entry has equal one-shot cost and
+     turns it into a loop-invariant load whenever the operation is hot. *)
+  let magic_cache = Hashtbl.create 4 in
+  let magic_initializers = ref [] in
+  if not has_call then begin
+    let used_physical = Hashtbl.create 32 in
+    Hashtbl.iter (fun _ -> function
+      | Reg physical -> Hashtbl.replace used_physical physical ()
+      | Spill _ -> ()
+    ) fa.fa_reg_map;
+    let candidates =
+      let caller_saved =
+        ["t0"; "t1"; "t2"; "t3"; "t4";
+         "a0"; "a1"; "a2"; "a3"; "a4"; "a5"; "a6"; "a7"]
+      in
+      if f.fir_name = "main" then
+        caller_saved @
+        ["s0"; "s1"; "s2"; "s3"; "s4"; "s5"; "s6"; "s7";
+         "s8"; "s9"; "s10"; "s11"; "ra"]
+      else caller_saved
+    in
+    let available = ref (List.filter (fun physical ->
+      not (Hashtbl.mem used_physical physical)
+    ) candidates) in
+    let counts = Hashtbl.create 8 in
+    List.iter (function
+      | Binop (_, ((Div | Mod) as op), _, VImm raw_divisor) ->
+        let divisor = normalize_i32 raw_divisor in
+        if divisor <> 0 && divisor <> 1 && divisor <> -1 &&
+           signed_power_of_two_magnitude divisor = None then begin
+          let count, needs_divisor =
+            match Hashtbl.find_opt counts divisor with
+            | Some existing -> existing
+            | None -> (0, false)
+          in
+          Hashtbl.replace counts divisor
+            (count + 1, needs_divisor || op = Mod)
+        end
+      | _ -> ()
+    ) f.fir_body;
+    let repeated =
+      Hashtbl.to_seq counts
+      |> List.of_seq
+      |> List.sort (fun (_, (left, _)) (_, (right, _)) ->
+           compare right left)
+    in
+    List.iter (fun (divisor, (_, needs_divisor)) ->
+      match !available with
+      | magic_reg :: rest ->
+        let divisor_reg, rest =
+          if needs_divisor then
+            match rest with
+            | reg :: remaining -> (Some reg, remaining)
+            | [] -> (None, rest)
+          else (None, rest)
+        in
+        if not needs_divisor || divisor_reg <> None then begin
+          available := rest;
+          Hashtbl.add magic_cache divisor (magic_reg, divisor_reg);
+          let magic, _ = signed_division_magic divisor in
+          magic_initializers :=
+            !magic_initializers @ [(magic_reg, magic)];
+          Option.iter (fun reg ->
+            magic_initializers :=
+              !magic_initializers @ [(reg, divisor)]
+          ) divisor_reg
+        end
+      | [] -> ()
+    ) repeated
+  end;
   let save_ra = f.fir_name <> "main" && has_call in
   let ra_off = stack_sz + spill_sz + callee_count * 4 in
   let frame_bytes = ra_off + (if save_ra then 4 else 0) in
@@ -569,6 +656,11 @@ let emit_func buf (f : func_ir) (fa : func_alloc) =
     end
   done;
 
+  List.iter (fun (physical, value) ->
+    Buffer.add_string buf
+      (Printf.sprintf "  li %s, %d\n" physical value)
+  ) !magic_initializers;
+
   let use_counts = Hashtbl.create 64 in
   let note_value = function
     | VImm _ | VReg 0 -> ()
@@ -601,11 +693,11 @@ let emit_func buf (f : func_ir) (fa : func_alloc) =
       emit_body rest
     | Unop (rd, Not, v) :: Bz (VReg branch_r, label) :: rest
       when rd = branch_r && used_once rd ->
-      emit_one buf spill_base fa.fa_reg_map (Bnz (v, label));
+      emit_one buf spill_base fa.fa_reg_map magic_cache (Bnz (v, label));
       emit_body rest
     | Unop (rd, Not, v) :: Bnz (VReg branch_r, label) :: rest
       when rd = branch_r && used_once rd ->
-      emit_one buf spill_base fa.fa_reg_map (Bz (v, label));
+      emit_one buf spill_base fa.fa_reg_map magic_cache (Bz (v, label));
       emit_body rest
     | Ret (Some v) :: [] ->
       let (rv, lv) = resolve_src fa.fa_reg_map spill_base "a0" v in
@@ -625,7 +717,7 @@ let emit_func buf (f : func_ir) (fa : func_alloc) =
       Buffer.add_string buf (Printf.sprintf "  j %s\n" ret_label);
       emit_body rest
     | instr :: rest ->
-      emit_one buf spill_base fa.fa_reg_map instr;
+      emit_one buf spill_base fa.fa_reg_map magic_cache instr;
       emit_body rest
     | [] -> ()
   in
